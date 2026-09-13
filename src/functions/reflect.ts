@@ -242,6 +242,10 @@ export function registerReflectFunctions(
       let newInsights = 0;
       let reinforced = 0;
       let clustersSkipped = 0;
+      // Run-wide cap (new + reinforced), shared by the concurrent workers.
+      // A worker reserves its slot synchronously before any await, so
+      // in-flight clusters cannot overshoot maxTotal between them.
+      let totalInsights = 0;
 
       const concurrency = Math.max(
         1,
@@ -258,6 +262,7 @@ export function registerReflectFunctions(
         conceptNames: string[],
       ): Promise<{ skipped: boolean; newInsights: number; reinforced: number }> => {
         const outcome = { skipped: false, newInsights: 0, reinforced: 0 };
+        if (totalInsights >= maxTotal) return outcome;
         const conceptSet = new Set(conceptNames.map((c) => c.toLowerCase()));
 
         const clusterFacts = semanticMemories.filter((s) => {
@@ -314,7 +319,8 @@ export function registerReflectFunctions(
 
           while (
             (match = insightRegex.exec(response)) !== null &&
-            clusterCount < maxInsightsPerCluster
+            clusterCount < maxInsightsPerCluster &&
+            totalInsights < maxTotal
           ) {
             const parsedConf = parseFloat(match[1]);
             const confidence = Number.isNaN(parsedConf)
@@ -324,6 +330,7 @@ export function registerReflectFunctions(
             const content = match[3].trim();
 
             if (!content) continue;
+            totalInsights++;
 
             const fp = fingerprintId("ins", content.trim().toLowerCase());
             const existing = await kv.get<Insight>(KV.insights, fp);
@@ -371,7 +378,7 @@ export function registerReflectFunctions(
       };
 
       const outcomes = await mapWithConcurrency(
-        conceptClusters.slice(0, maxTotal),
+        conceptClusters,
         concurrency,
         processCluster,
       );

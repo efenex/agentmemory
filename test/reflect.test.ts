@@ -386,3 +386,48 @@ describe("Reflect", () => {
     });
   });
 });
+
+describe("Reflect run-wide insight cap", () => {
+  // Fork: clusters are synthesized concurrently (AGENTMEMORY_REFLECT_CONCURRENCY).
+  // The 50-insight run cap must hold across workers, as upstream's serial loop does.
+  it("caps a run at 50 insights across concurrent clusters", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    let call = 0;
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockImplementation(async () => {
+        const n = call++;
+        const items = Array.from(
+          { length: 5 },
+          (_, i) =>
+            `<insight confidence="0.8" title="T${n}-${i}">Unique insight ${n}-${i}</insight>`,
+        );
+        return `<insights>${items.join("\n")}</insights>`;
+      }),
+    };
+    registerReflectFunctions(sdk as never, kv as never, provider as never);
+
+    const nodes: GraphNode[] = [];
+    const edges: GraphEdge[] = [];
+    for (let c = 0; c < 20; c++) {
+      nodes.push(makeConceptNode(`hub${c}`), makeConceptNode(`left${c}`), makeConceptNode(`right${c}`));
+      edges.push(makeEdge(`hub${c}`, `left${c}`), makeEdge(`hub${c}`, `right${c}`));
+      for (let f = 0; f < 3; f++) {
+        await kv.set("mem:semantic", `sem_${c}_${f}`, makeSemantic(`fact ${f} about hub${c}`, `sem_${c}_${f}`));
+      }
+    }
+    await seedGraphSnapshot(kv, nodes, edges);
+
+    const result = (await sdk.trigger("mem::reflect", { maxClusters: 20 })) as {
+      success: boolean;
+      newInsights: number;
+      reinforced: number;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.newInsights + result.reinforced).toBe(50);
+    expect((await kv.list<Insight>("mem:insights")).length).toBe(50);
+  });
+});
