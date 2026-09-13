@@ -256,11 +256,19 @@ export interface MemorySlot {
   updatedAt: string;
 }
 
+// Asymmetric retrieval models (nomic-embed-text, e5, bge) are trained to
+// embed search queries and indexed documents differently. Providers that
+// support it use this to pick the right input format; others ignore it.
+export type EmbeddingTaskType = "query" | "document";
+
 export interface EmbeddingProvider {
   name: string;
   dimensions: number;
-  embed(text: string): Promise<Float32Array>;
-  embedBatch(texts: string[]): Promise<Float32Array[]>;
+  embed(text: string, taskType?: EmbeddingTaskType): Promise<Float32Array>;
+  embedBatch(
+    texts: string[],
+    taskType?: EmbeddingTaskType,
+  ): Promise<Float32Array[]>;
   embedImage?(src: string): Promise<Float32Array>;
 }
 

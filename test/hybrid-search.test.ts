@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
+import { VectorIndex } from "../src/state/vector-index.js";
 import type { CompressedObservation, EmbeddingProvider } from "../src/types.js";
 
 function makeObs(
@@ -64,6 +65,30 @@ describe("HybridSearch", () => {
     expect(results[0].observation.id).toBe("obs_1");
     expect(results[0].vectorScore).toBe(0);
     expect(results[0].bm25Score).toBeGreaterThan(0);
+  });
+
+  it("embeds the search query with the query task type", async () => {
+    const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
+    bm25.add(obs);
+    await kv.set("mem:obs:ses_1", "obs_1", obs);
+    const vector = new VectorIndex();
+    vector.add("obs_1", "ses_1", new Float32Array([1, 0]));
+
+    const taskTypes: Array<string | undefined> = [];
+    const provider: EmbeddingProvider = {
+      name: "fake",
+      dimensions: 2,
+      embed: async (_text, taskType) => {
+        taskTypes.push(taskType);
+        return new Float32Array([1, 0]);
+      },
+      embedBatch: async (texts) => texts.map(() => new Float32Array([1, 0])),
+    };
+
+    const hybrid = new HybridSearch(bm25, vector, provider, kv as never);
+    await hybrid.search("auth");
+
+    expect(taskTypes).toEqual(["query"]);
   });
 
   it("returns empty results for no-match query", async () => {

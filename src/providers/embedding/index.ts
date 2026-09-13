@@ -66,9 +66,10 @@ export function withDimensionGuard(provider: EmbeddingProvider): EmbeddingProvid
   // Preserve the provider's prototype chain so `instanceof` checks
   // against concrete classes (e.g. GeminiEmbeddingProvider) keep working.
   const wrapped = Object.create(provider) as EmbeddingProvider;
-  wrapped.embed = async (t) => check(await provider.embed(t), "embed");
-  wrapped.embedBatch = async (ts) => {
-    const out = await provider.embedBatch(ts);
+  wrapped.embed = async (t, taskType) =>
+    check(await provider.embed(t, taskType), "embed");
+  wrapped.embedBatch = async (ts, taskType) => {
+    const out = await provider.embedBatch(ts, taskType);
     out.forEach((v, i) => check(v, `embedBatch[${i}]`));
     return out;
   };

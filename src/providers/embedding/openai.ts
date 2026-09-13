@@ -1,4 +1,4 @@
-import type { EmbeddingProvider } from "../../types.js";
+import type { EmbeddingProvider, EmbeddingTaskType } from "../../types.js";
 import { getEnvVar } from "../../config.js";
 import { fetchWithTimeout } from "../_fetch.js";
 import {
@@ -47,7 +47,29 @@ const DEFAULT_MODEL = "text-embedding-3-small";
  *   OPENAI_EMBEDDING_DIMENSIONS  — override reported dimensions (required for
  *                                  custom / self-hosted models not in the
  *                                  shared MODEL_DIMENSIONS table)
+ *   OPENAI_EMBEDDING_TASK_PREFIX — task-prefix style (off by default). `nomic`
+ *                                  prepends `search_query: ` to search queries
+ *                                  and `search_document: ` to indexed content,
+ *                                  as nomic-embed-text models require. Changing
+ *                                  it invalidates existing vectors.
  */
+const TASK_PREFIXES: Record<string, Record<EmbeddingTaskType, string>> = {
+  nomic: { query: "search_query: ", document: "search_document: " },
+};
+
+function resolveTaskPrefixes(
+  style: string | undefined,
+): Record<EmbeddingTaskType, string> | null {
+  const key = style?.trim().toLowerCase();
+  if (!key || key === "none") return null;
+  const prefixes = TASK_PREFIXES[key];
+  if (!prefixes) {
+    throw new Error(
+      `OPENAI_EMBEDDING_TASK_PREFIX must be one of: none, ${Object.keys(TASK_PREFIXES).join(", ")}; got: ${style}`,
+    );
+  }
+  return prefixes;
+}
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly name = "openai";
   readonly dimensions: number;
@@ -56,6 +78,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private model: string;
   private isAzure: boolean;
   private azureApiVersion: string;
+  private taskPrefixes: Record<EmbeddingTaskType, string> | null;
 
   constructor(apiKey?: string) {
     // Separate API key path: caller-passed wins, then OPENAI_EMBEDDING_API_KEY,
@@ -87,14 +110,23 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.isAzure = detectAzure(this.baseUrl);
     this.azureApiVersion =
       getEnvVar("OPENAI_API_VERSION") || DEFAULT_AZURE_API_VERSION;
+    this.taskPrefixes = resolveTaskPrefixes(
+      getEnvVar("OPENAI_EMBEDDING_TASK_PREFIX"),
+    );
   }
 
-  async embed(text: string): Promise<Float32Array> {
-    const [result] = await this.embedBatch([text]);
+  async embed(
+    text: string,
+    taskType: EmbeddingTaskType = "document",
+  ): Promise<Float32Array> {
+    const [result] = await this.embedBatch([text], taskType);
     return result;
   }
 
-  async embedBatch(texts: string[]): Promise<Float32Array[]> {
+  async embedBatch(
+    texts: string[],
+    taskType: EmbeddingTaskType = "document",
+  ): Promise<Float32Array[]> {
     const url = buildEmbeddingUrl(
       this.baseUrl,
       this.isAzure,
@@ -105,7 +137,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
       headers: buildAuthHeaders(this.apiKey, this.isAzure),
       body: JSON.stringify({
         model: this.model,
-        input: texts,
+        input: this.withTaskPrefix(texts, taskType),
       }),
     });
 
@@ -119,5 +151,11 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     };
 
     return data.data.map((d) => new Float32Array(d.embedding));
+  }
+
+  private withTaskPrefix(texts: string[], taskType: EmbeddingTaskType): string[] {
+    if (!this.taskPrefixes) return texts;
+    const prefix = this.taskPrefixes[taskType];
+    return texts.map((t) => prefix + t);
   }
 }

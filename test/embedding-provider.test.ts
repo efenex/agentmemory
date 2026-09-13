@@ -139,6 +139,74 @@ describe("OpenAIEmbeddingProvider", () => {
     expect(provider.dimensions).toBe(1536);
   });
 
+  describe("OPENAI_EMBEDDING_TASK_PREFIX", () => {
+    beforeEach(() => {
+      delete process.env["OPENAI_EMBEDDING_TASK_PREFIX"];
+    });
+
+    function mockEmbeddings() {
+      return vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+        const { input } = JSON.parse((init as RequestInit).body as string) as { input: string[] };
+        return new Response(
+          JSON.stringify({ data: input.map(() => ({ embedding: [0.1, 0.2, 0.3] })) }),
+          { status: 200 },
+        );
+      });
+    }
+
+    function sentInput(spy: ReturnType<typeof mockEmbeddings>, call: number): string[] {
+      return JSON.parse((spy.mock.calls[call][1] as RequestInit).body as string).input;
+    }
+
+    it("leaves input unprefixed by default, even for nomic models", async () => {
+      process.env["OPENAI_EMBEDDING_MODEL"] = "nomic-embed-text-v1.5";
+      const provider = new OpenAIEmbeddingProvider("test-key");
+      const fetchSpy = mockEmbeddings();
+
+      await provider.embed("hello", "query");
+      expect(sentInput(fetchSpy, 0)).toEqual(["hello"]);
+
+      fetchSpy.mockRestore();
+    });
+
+    it("prefixes documents by default and queries when asked, when set to nomic", async () => {
+      process.env["OPENAI_EMBEDDING_MODEL"] = "nomic-embed-text-v1.5";
+      process.env["OPENAI_EMBEDDING_TASK_PREFIX"] = "nomic";
+      const provider = new OpenAIEmbeddingProvider("test-key");
+      const fetchSpy = mockEmbeddings();
+
+      await provider.embed("hello");
+      await provider.embed("hello", "query");
+      await provider.embedBatch(["a", "b"]);
+      await provider.embedBatch(["c"], "query");
+
+      expect(sentInput(fetchSpy, 0)).toEqual(["search_document: hello"]);
+      expect(sentInput(fetchSpy, 1)).toEqual(["search_query: hello"]);
+      expect(sentInput(fetchSpy, 2)).toEqual(["search_document: a", "search_document: b"]);
+      expect(sentInput(fetchSpy, 3)).toEqual(["search_query: c"]);
+
+      fetchSpy.mockRestore();
+    });
+
+    it("treats none as off", async () => {
+      process.env["OPENAI_EMBEDDING_TASK_PREFIX"] = "none";
+      const provider = new OpenAIEmbeddingProvider("test-key");
+      const fetchSpy = mockEmbeddings();
+
+      await provider.embed("hello", "query");
+      expect(sentInput(fetchSpy, 0)).toEqual(["hello"]);
+
+      fetchSpy.mockRestore();
+    });
+
+    it("rejects unknown prefix styles", () => {
+      process.env["OPENAI_EMBEDDING_TASK_PREFIX"] = "e6";
+      expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
+        /OPENAI_EMBEDDING_TASK_PREFIX must be one of: none, nomic; got: e6/,
+      );
+    });
+  });
+
   it("rejects invalid OPENAI_EMBEDDING_DIMENSIONS values", () => {
     process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "not-a-number";
     expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
@@ -226,6 +294,29 @@ describe("withDimensionGuard", () => {
     await expect(guarded.embedBatch(["a", "b"])).rejects.toThrow(
       /dimension mismatch in fake\.embedBatch\[1\]: expected 4, got 2/,
     );
+  });
+
+  it("forwards the task type to the wrapped provider", async () => {
+    const seen: Array<string | undefined> = [];
+    const inner: EmbeddingProvider = {
+      name: "fake",
+      dimensions: 2,
+      embed: async (_text, taskType) => {
+        seen.push(taskType);
+        return new Float32Array([1, 2]);
+      },
+      embedBatch: async (texts, taskType) => {
+        seen.push(taskType);
+        return texts.map(() => new Float32Array([1, 2]));
+      },
+    };
+    const guarded = withDimensionGuard(inner);
+
+    await guarded.embed("q", "query");
+    await guarded.embedBatch(["d"], "document");
+    await guarded.embed("plain");
+
+    expect(seen).toEqual(["query", "document", undefined]);
   });
 
   it("guards embedImage when present and omits it when absent", async () => {
