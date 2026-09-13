@@ -255,12 +255,12 @@ describe("Smart Search Function", () => {
 
       await sdk.trigger("mem::smart-search", {
         query: "rebase",
-        project: "example-app",
+        project: "gitops-assistant",
       });
 
       expect(receivedPayload).toMatchObject({
         query: "rebase",
-        project: "example-app",
+        project: "gitops-assistant",
       });
     });
 

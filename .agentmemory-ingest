@@ -1,0 +1,34 @@
+# agentmemory ingestion manifest — describes which in-repo docs to
+# ingest into agentmemory's memory store. Processed by
+# `scripts/import-repo-docs.sh` (typically called from the Stop hook).
+#
+# Format: gitignore-style. One glob per line. `!` prefix excludes.
+# `#` is a comment. Excludes win over includes. Globs are relative to
+# the repo root. `**` is supported.
+#
+# V2 behavior:
+#   - Files larger than AGENTMEMORY_DOC_MAX_BYTES (default 50KB) get
+#     split by ## / ### / paragraph boundaries with greedy coalescing,
+#     so big runbooks land as multiple memories instead of being skipped.
+#   - Filenames matching `**/session-handoff-YYYY-MM-DD*.md` are routed
+#     as `[Session handoff]` memories tagged with `session:<id>` concepts
+#     for every session on that date for this project.
+#   - Sidecar is keyed by <project-basename>:<rel-path>, so repo moves
+#     don't trigger phantom re-imports.
+#
+# This file is itself an example you can copy to other repos.
+
+# Top-level README + design docs.
+README.md
+
+# When deploy/ docs stabilize, ingest them so the patterns are
+# searchable across sessions. For now there's no upstream design doc
+# directory worth ingesting here (the upstream README.md covers it).
+
+# Skip transient files. (Note: if you want session-handoff-*.md ingested
+# WITH session-linking, REMOVE the matching exclude — V2 handles them
+# specially. We exclude them here in the agentmemory repo only because
+# this repo's plans/ subdir isn't yet populated.)
+!docs/plans/session-handoff-*.md
+!docs/external-review-*.md
+!TODO.md
