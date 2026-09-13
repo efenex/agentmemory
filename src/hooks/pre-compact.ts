@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { resolveProject, hookCwd } from "./_project.js";
 
+import { newTraceparent } from "./_traceparent.js";
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
   if (!payload || typeof payload !== "object") return false;
@@ -11,7 +12,7 @@ const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 
 function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
+  const h: Record<string, string> = { "Content-Type": "application/json", "traceparent": newTraceparent() };
   if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
   return h;
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { newTraceparent } from "./_traceparent.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { hookCwd } from "./_project.js";
@@ -17,7 +18,7 @@ const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 const TIMEOUT_MS = 1500;
 
 function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
+  const h: Record<string, string> = { "Content-Type": "application/json", "traceparent": newTraceparent() };
   if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
   return h;
 }

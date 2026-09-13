@@ -1,6 +1,12 @@
 #!/usr/bin/env node
+import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+//#region src/hooks/_traceparent.ts
+function newTraceparent() {
+	return `00-${randomBytes(16).toString("hex")}-${randomBytes(8).toString("hex")}-01`;
+}
+//#endregion
 //#region src/hooks/_project.ts
 function hookCwd(data) {
 	if (!data || typeof data !== "object") return void 0;
@@ -24,7 +30,10 @@ const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 const TIMEOUT_MS = 1500;
 function authHeaders() {
-	const h = { "Content-Type": "application/json" };
+	const h = {
+		"Content-Type": "application/json",
+		"traceparent": newTraceparent()
+	};
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
 	return h;
 }

@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+import { randomBytes } from "node:crypto";
+//#region src/hooks/_traceparent.ts
+function newTraceparent() {
+	return `00-${randomBytes(16).toString("hex")}-${randomBytes(8).toString("hex")}-01`;
+}
+//#endregion
 //#region src/hooks/pre-tool-use.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -9,7 +15,10 @@ const INJECT_CONTEXT = process.env["AGENTMEMORY_INJECT_CONTEXT"] === "true";
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 function authHeaders() {
-	const h = { "Content-Type": "application/json" };
+	const h = {
+		"Content-Type": "application/json",
+		"traceparent": newTraceparent()
+	};
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
 	return h;
 }

@@ -32,8 +32,23 @@ const shared = {
   deps: {
     neverBundle: [
       "@huggingface/transformers",
+      // onnxruntime is @huggingface/transformers' native backend; bundling
+      // it breaks its .node loading the same way it did under @xenova.
+      "onnxruntime-node",
+      "onnxruntime-web",
       "@anthropic-ai/claude-agent-sdk",
       "@anthropic-ai/sdk",
+      // OTel SDK packages stay unbundled (loaded from node_modules at
+      // runtime) so they don't perturb the bundle's chunk graph. Pulling
+      // them in via tsdown introduces TDZ + __exportAll cycles between
+      // cli.mjs, src-*.mjs and the synthetic chunk for version.ts.
+      // Carried across upstream's `external:` -> `deps.neverBundle`
+      // rename (0.9.29); the cycle bug returns if these are dropped.
+      "@opentelemetry/sdk-trace-node",
+      "@opentelemetry/sdk-trace-base",
+      "@opentelemetry/exporter-trace-otlp-http",
+      "@opentelemetry/resources",
+      "@opentelemetry/semantic-conventions",
     ],
   },
   // Each entry is its own build, so the per-entry dts/deps timing notice

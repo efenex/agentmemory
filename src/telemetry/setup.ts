@@ -6,9 +6,15 @@ interface OtelConfig {
   metricsExportIntervalMs: number;
 }
 
+// VERSION is resolved through a getter, not captured at module-eval
+// time. After Phase 2 (tracer.ts) the bundler can place this module
+// above version.ts in the merged output, which used to cause a TDZ
+// ReferenceError on the literal `serviceVersion: VERSION` initializer.
 export const OTEL_CONFIG: OtelConfig = {
   serviceName: "agentmemory",
-  serviceVersion: VERSION,
+  get serviceVersion() {
+    return VERSION;
+  },
   metricsExportIntervalMs: 30_000,
 };
 

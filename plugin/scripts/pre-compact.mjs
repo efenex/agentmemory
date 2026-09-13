@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
 import { basename } from "node:path";
+import { randomBytes } from "node:crypto";
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -31,6 +32,11 @@ function hookCwd(data) {
 	if (projectDir && projectDir.trim()) return projectDir;
 }
 //#endregion
+//#region src/hooks/_traceparent.ts
+function newTraceparent() {
+	return `00-${randomBytes(16).toString("hex")}-${randomBytes(8).toString("hex")}-01`;
+}
+//#endregion
 //#region src/hooks/pre-compact.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -40,7 +46,10 @@ function isSdkChildContext(payload) {
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 function authHeaders() {
-	const h = { "Content-Type": "application/json" };
+	const h = {
+		"Content-Type": "application/json",
+		"traceparent": newTraceparent()
+	};
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
 	return h;
 }
