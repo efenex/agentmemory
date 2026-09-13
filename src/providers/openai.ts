@@ -87,9 +87,8 @@ export class OpenAIProvider implements MemoryProvider {
     //
     // Belt-and-suspenders: send `chat_template_kwargs.enable_thinking=
     // false` as the server-side signal AND prefix `/no_think` to the
-    // system message as the client-side fallback (same pattern as
-    // gitops-assistant's llm_engine.py:6207-6260, which has a
-    // documented "$7 Qwen3-32B incident" from missing this signal).
+    // system message as the client-side fallback, for servers whose chat
+    // template ignores the kwarg.
     const disableThinking =
       (getEnvVar("AGENTMEMORY_DISABLE_THINKING") || "").toLowerCase() === "true";
     const effectiveSystemPrompt = disableThinking
