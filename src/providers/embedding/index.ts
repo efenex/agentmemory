@@ -7,6 +7,13 @@ import { CohereEmbeddingProvider } from "./cohere.js";
 import { OpenRouterEmbeddingProvider } from "./openrouter.js";
 import { LocalEmbeddingProvider } from "./local.js";
 import { ClipEmbeddingProvider } from "./clip.js";
+import {
+  embeddingRequestsTotal,
+  embeddingRequestDurationMs,
+  embeddingBatchSize,
+  metricsEnabled,
+} from "../../telemetry/prometheus.js";
+import { withSpan, tracingEnabled } from "../../telemetry/tracer.js";
 
 export {
   GeminiEmbeddingProvider,
@@ -23,7 +30,9 @@ let imageEmbeddingProvider: EmbeddingProvider | null = null;
 export function createImageEmbeddingProvider(): EmbeddingProvider | null {
   if (process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] !== "true") return null;
   if (imageEmbeddingProvider) return imageEmbeddingProvider;
-  imageEmbeddingProvider = withDimensionGuard(new ClipEmbeddingProvider());
+  imageEmbeddingProvider = withMetrics(
+    withDimensionGuard(new ClipEmbeddingProvider()),
+  );
   return imageEmbeddingProvider;
 }
 
@@ -31,19 +40,22 @@ export function createEmbeddingProvider(): EmbeddingProvider | null {
   const detected = detectEmbeddingProvider();
   if (!detected) return null;
 
+  const wrap = (p: EmbeddingProvider) =>
+    withMetrics(withDimensionGuard(p));
+
   switch (detected) {
     case "gemini":
-      return withDimensionGuard(new GeminiEmbeddingProvider(getEnvVar("GEMINI_API_KEY")!));
+      return wrap(new GeminiEmbeddingProvider(getEnvVar("GEMINI_API_KEY")!));
     case "openai":
-      return withDimensionGuard(new OpenAIEmbeddingProvider(getEnvVar("OPENAI_API_KEY")!));
+      return wrap(new OpenAIEmbeddingProvider(getEnvVar("OPENAI_API_KEY")!));
     case "voyage":
-      return withDimensionGuard(new VoyageEmbeddingProvider(getEnvVar("VOYAGE_API_KEY")!));
+      return wrap(new VoyageEmbeddingProvider(getEnvVar("VOYAGE_API_KEY")!));
     case "cohere":
-      return withDimensionGuard(new CohereEmbeddingProvider(getEnvVar("COHERE_API_KEY")!));
+      return wrap(new CohereEmbeddingProvider(getEnvVar("COHERE_API_KEY")!));
     case "openrouter":
-      return withDimensionGuard(new OpenRouterEmbeddingProvider(getEnvVar("OPENROUTER_API_KEY")!));
+      return wrap(new OpenRouterEmbeddingProvider(getEnvVar("OPENROUTER_API_KEY")!));
     case "local":
-      return withDimensionGuard(new LocalEmbeddingProvider());
+      return wrap(new LocalEmbeddingProvider());
     default:
       return null;
   }
@@ -66,15 +78,98 @@ export function withDimensionGuard(provider: EmbeddingProvider): EmbeddingProvid
   // Preserve the provider's prototype chain so `instanceof` checks
   // against concrete classes (e.g. GeminiEmbeddingProvider) keep working.
   const wrapped = Object.create(provider) as EmbeddingProvider;
-  wrapped.embed = async (t) => check(await provider.embed(t), "embed");
-  wrapped.embedBatch = async (ts) => {
-    const out = await provider.embedBatch(ts);
+  wrapped.embed = async (t, tt) => check(await provider.embed(t, tt), "embed");
+  wrapped.embedBatch = async (ts, tt) => {
+    const out = await provider.embedBatch(ts, tt);
     out.forEach((v, i) => check(v, `embedBatch[${i}]`));
     return out;
   };
   if (provider.embedImage) {
     wrapped.embedImage = async (s: string) =>
       check(await provider.embedImage!(s), "embedImage");
+  }
+  return wrapped;
+}
+
+// Wrap an embedding provider with Prometheus instrumentation. Mirror
+// of the withDimensionGuard pattern: preserves the prototype chain so
+// `instanceof` checks against the concrete classes keep working.
+// No-op overhead when metrics are disabled.
+export function withMetrics(provider: EmbeddingProvider): EmbeddingProvider {
+  if (!metricsEnabled() && !tracingEnabled()) return provider;
+  const wrapped = Object.create(provider) as EmbeddingProvider;
+  const label = provider.name;
+  wrapped.embedBatch = async (texts, taskType) =>
+    withSpan(
+      "embedding.batch",
+      {
+        "gen_ai.system": label,
+        "gen_ai.operation.name": "embed_batch",
+        "agentmemory.batch_size": texts.length,
+      },
+      async () => {
+        const t0 = Date.now();
+        try {
+          const out = await provider.embedBatch(texts, taskType);
+          const dur = Date.now() - t0;
+          if (metricsEnabled()) {
+            embeddingRequestsTotal.inc({ provider: label, status: "success" });
+            embeddingRequestDurationMs.observe({ provider: label }, dur);
+            embeddingBatchSize.observe({ provider: label }, texts.length);
+          }
+          return out;
+        } catch (err) {
+          if (metricsEnabled()) {
+            embeddingRequestsTotal.inc({ provider: label, status: "error" });
+            embeddingRequestDurationMs.observe(
+              { provider: label },
+              Date.now() - t0,
+            );
+          }
+          throw err;
+        }
+      },
+    );
+  // embed() calls embedBatch() in every concrete impl, so it's
+  // already instrumented transitively. Leave it alone.
+  if (provider.embedImage) {
+    wrapped.embedImage = async (s: string) =>
+      withSpan(
+        "embedding.image",
+        {
+          "gen_ai.system": label,
+          "gen_ai.operation.name": "embed_image",
+        },
+        async () => {
+          const t0 = Date.now();
+          try {
+            const out = await provider.embedImage!(s);
+            if (metricsEnabled()) {
+              embeddingRequestsTotal.inc({
+                provider: label,
+                status: "success",
+              });
+              embeddingRequestDurationMs.observe(
+                { provider: label },
+                Date.now() - t0,
+              );
+            }
+            return out;
+          } catch (err) {
+            if (metricsEnabled()) {
+              embeddingRequestsTotal.inc({
+                provider: label,
+                status: "error",
+              });
+              embeddingRequestDurationMs.observe(
+                { provider: label },
+                Date.now() - t0,
+              );
+            }
+            throw err;
+          }
+        },
+      );
   }
   return wrapped;
 }

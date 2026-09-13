@@ -1,0 +1,102 @@
+[
+  {
+    "system": "bm25-only (today)",
+    "corpus": "synthetic",
+    "recall5": 0.42547619047619045,
+    "recall10": 0.5788095238095238,
+    "ndcg10": 0.8473397362997771,
+    "mrr": 0.9166666666666667,
+    "embedMs": 0.0037079999999605207,
+    "searchMs": 2.909781250000003
+  },
+  {
+    "system": "nomic-embed-text (768d)",
+    "corpus": "synthetic",
+    "recall5": 0.44297619047619047,
+    "recall10": 0.6251190476190477,
+    "ndcg10": 0.9289668102968257,
+    "mrr": 1,
+    "embedMs": 1469.416708,
+    "searchMs": 33.9314396
+  },
+  {
+    "system": "embeddinggemma (768d)",
+    "corpus": "synthetic",
+    "recall5": 0.4479761904761904,
+    "recall10": 0.5883095238095237,
+    "ndcg10": 0.886800841358761,
+    "mrr": 1,
+    "embedMs": 1717.0101250000002,
+    "searchMs": 41.98331874999999
+  },
+  {
+    "system": "qwen3-embedding:0.6b (1024d)",
+    "corpus": "synthetic",
+    "recall5": 0.43797619047619046,
+    "recall10": 0.5951190476190477,
+    "ndcg10": 0.8830990262390888,
+    "mrr": 0.9583333333333334,
+    "embedMs": 5526.080625,
+    "searchMs": 28.54207919999999
+  },
+  {
+    "system": "qwen3-embedding:8b (1024d)",
+    "corpus": "synthetic",
+    "recall5": 0.42997619047619046,
+    "recall10": 0.6151190476190476,
+    "ndcg10": 0.8975136524616385,
+    "mrr": 0.9666666666666666,
+    "embedMs": 11997.888208999999,
+    "searchMs": 54.238747949999926
+  },
+  {
+    "system": "bm25-only (today)",
+    "corpus": "coding-life",
+    "recall5": 1,
+    "recall10": 1,
+    "ndcg10": 0.8975620653113128,
+    "mrr": 0.8666666666666667,
+    "embedMs": 0.0003749999996216502,
+    "searchMs": 0.09765553333345452
+  },
+  {
+    "system": "nomic-embed-text (768d)",
+    "corpus": "coding-life",
+    "recall5": 1,
+    "recall10": 1,
+    "ndcg10": 0.9549570771459152,
+    "mrr": 0.9333333333333333,
+    "embedMs": 89.55375000000276,
+    "searchMs": 267.98311666666655
+  },
+  {
+    "system": "embeddinggemma (768d)",
+    "corpus": "coding-life",
+    "recall5": 1,
+    "recall10": 1,
+    "ndcg10": 0.9496051297557943,
+    "mrr": 0.9333333333333333,
+    "embedMs": 2353.3120420000014,
+    "searchMs": 35.632224999999984
+  },
+  {
+    "system": "qwen3-embedding:0.6b (1024d)",
+    "corpus": "coding-life",
+    "recall5": 1,
+    "recall10": 1,
+    "ndcg10": 0.9496051297557943,
+    "mrr": 0.9333333333333333,
+    "embedMs": 2146.8404159999955,
+    "searchMs": 30.008694466666686
+  },
+  {
+    "system": "qwen3-embedding:8b (1024d)",
+    "corpus": "coding-life",
+    "recall5": 1,
+    "recall10": 1,
+    "ndcg10": 0.9549570771459152,
+    "mrr": 0.9333333333333333,
+    "embedMs": 744.2400839999973,
+    "searchMs": 57.503836133333486
+  }
+]

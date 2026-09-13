@@ -139,6 +139,81 @@ describe("OpenAIEmbeddingProvider", () => {
     expect(provider.dimensions).toBe(1536);
   });
 
+  it("adds nomic task prefixes for document and query embeds", async () => {
+    process.env["OPENAI_EMBEDDING_MODEL"] = "text-embedding-nomic-embed-text-v1.5";
+    process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "3";
+    const provider = new OpenAIEmbeddingProvider("test-key");
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), { status: 200 }),
+    );
+
+    await provider.embed("hello");
+    let body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.input).toEqual(["search_document: hello"]);
+
+    await provider.embed("hello", "query");
+    body = JSON.parse((fetchSpy.mock.calls[1][1] as RequestInit).body as string);
+    expect(body.input).toEqual(["search_query: hello"]);
+
+    fetchSpy.mockRestore();
+  });
+
+  it("does not prefix non-nomic models", async () => {
+    process.env["OPENAI_EMBEDDING_MODEL"] = "Qwen3-Embedding-8B";
+    process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "3";
+    const provider = new OpenAIEmbeddingProvider("test-key");
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), { status: 200 }),
+    );
+
+    await provider.embed("hello", "query");
+    const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.input).toEqual(["hello"]);
+
+    fetchSpy.mockRestore();
+  });
+
+  it("truncates and renormalizes when the server ignores the dimensions field", async () => {
+    process.env["OPENAI_EMBEDDING_MODEL"] = "text-embedding-nomic-embed-text-v1.5";
+    process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "2";
+    const provider = new OpenAIEmbeddingProvider("test-key");
+
+    // Server returns 4 dims despite dimensions:2 in the request (LM Studio behavior)
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ embedding: [3, 4, 5, 6] }] }), { status: 200 }),
+    );
+
+    const vec = await provider.embed("hello");
+    expect(vec.length).toBe(2);
+    // first 2 dims [3,4] renormalized to unit length: [0.6, 0.8]
+    expect(vec[0]).toBeCloseTo(0.6, 5);
+    expect(vec[1]).toBeCloseTo(0.8, 5);
+
+    fetchSpy.mockRestore();
+  });
+
+  it("does not truncate when dimensions were not explicitly configured", async () => {
+    process.env["OPENAI_EMBEDDING_MODEL"] = "mystery-self-hosted-model";
+    const provider = new OpenAIEmbeddingProvider("test-key");
+    expect(provider.dimensions).toBe(1536);
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({ data: [{ embedding: Array.from({ length: 2048 }, () => 0.5) }] }),
+        { status: 200 },
+      ),
+    );
+
+    // Oversized vector must survive untouched so the dimension guard can
+    // surface the misconfiguration instead of silently truncating.
+    const vec = await provider.embed("hello");
+    expect(vec.length).toBe(2048);
+
+    fetchSpy.mockRestore();
+  });
+
   it("rejects invalid OPENAI_EMBEDDING_DIMENSIONS values", () => {
     process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "not-a-number";
     expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
