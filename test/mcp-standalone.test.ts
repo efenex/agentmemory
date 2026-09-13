@@ -64,13 +64,14 @@ describe("Tools Registry", () => {
       "memory_obsidian_export",
       "memory_save",
       "memory_recall",
+      "memory_action_get",
     ]) {
       expect(tools.some((t) => t.name === required)).toBe(true);
     }
   });
 
-  it("CORE_TOOLS has 14 items", () => {
-    expect(CORE_TOOLS.length).toBe(14);
+  it("CORE_TOOLS has 15 items", () => {
+    expect(CORE_TOOLS.length).toBe(15);
   });
 
   it("V040_TOOLS has 8 items", () => {

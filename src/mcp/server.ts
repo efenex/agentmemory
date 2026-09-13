@@ -1,6 +1,9 @@
 import type { ISdk, ApiRequest } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
+import { instrumentedDispatch } from "../telemetry/prometheus.js";
+import { withSpan } from "../telemetry/tracer.js";
+import { runWithContext } from "../telemetry/context.js";
 import type {
   SessionSummary,
   Memory,
@@ -58,7 +61,7 @@ export function registerMcpEndpoints(
     return null;
   }
 
-  sdk.registerFunction("mcp::tools::list", 
+  sdk.registerFunction("mcp::tools::list",
     async (req: ApiRequest): Promise<McpResponse> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
@@ -84,6 +87,28 @@ export function registerMcpEndpoints(
 
       const { name, arguments: args = {} } = req.body;
 
+      // Outer span + per-call metric. instrumentedDispatch derives
+      // status from status_code; withSpan records exceptions + sets
+      // status from throw vs return (cases return structured errors).
+      // runWithContext seeds AsyncLocalStorage so providers + logger
+      // (Phase 3) can reach in for sessionId/project later in the call.
+      return runWithContext(
+        {
+          sessionId:
+            typeof args.sessionId === "string" ? args.sessionId : undefined,
+          project:
+            typeof args.project === "string" ? args.project : undefined,
+        },
+        () => withSpan(
+          `mcp::${name}`,
+          {
+            "mcp.tool_name": name,
+            "agentmemory.session_id":
+              typeof args.sessionId === "string" ? args.sessionId : undefined,
+            "agentmemory.project":
+              typeof args.project === "string" ? args.project : undefined,
+          },
+          async () => instrumentedDispatch(`mcp::${name}`, async () => {
       try {
         switch (name) {
           case "memory_recall": {
@@ -285,6 +310,114 @@ export function registerMcpEndpoints(
                 expandIds,
                 limit,
               },
+            });
+            return {
+              status_code: 200,
+              body: {
+                content: [
+                  { type: "text", text: JSON.stringify(result, null, 2) },
+                ],
+              },
+            };
+          }
+
+          case "memory_lineage": {
+            if (typeof args.query !== "string" || !args.query.trim()) {
+              return {
+                status_code: 400,
+                body: { error: "query is required for memory_lineage" },
+              };
+            }
+            const channels = parseCsvList(args.channels);
+            // Validate channel names against the enum. If the user
+            // passed channels but NONE are valid, 400 instead of
+            // silently broadening to all channels (CodeRabbit caught
+            // this in the #570 re-review).
+            const validChannels = channels.filter((c) =>
+              ["observation", "memory", "lesson", "summary"].includes(c),
+            );
+            if (channels.length > 0 && validChannels.length === 0) {
+              return {
+                status_code: 400,
+                body: {
+                  error:
+                    "channels must contain at least one of: observation, memory, lesson, summary",
+                },
+              };
+            }
+            const payload: Record<string, unknown> = {
+              query: args.query,
+            };
+            const limit = asNumber(args.limit);
+            if (args.limit !== undefined) {
+              if (limit === undefined || !Number.isInteger(limit) || limit < 1) {
+                return {
+                  status_code: 400,
+                  body: { error: "limit must be a positive integer" },
+                };
+              }
+              payload.limit = Math.min(500, limit);
+            }
+            if (typeof args.since === "string") payload.since = args.since;
+            if (typeof args.until === "string") payload.until = args.until;
+            if (validChannels.length > 0) payload.channels = validChannels;
+            if (typeof args.includeAdjacentTurns === "boolean")
+              payload.includeAdjacentTurns = args.includeAdjacentTurns;
+            if (typeof args.includeGraph === "boolean")
+              payload.includeGraph = args.includeGraph;
+            if (args.order !== undefined) {
+              if (
+                typeof args.order !== "string" ||
+                !["asc", "desc"].includes(args.order)
+              ) {
+                return {
+                  status_code: 400,
+                  body: { error: "order must be 'asc' or 'desc'" },
+                };
+              }
+              payload.order = args.order;
+            }
+            const result = await sdk.trigger({
+              function_id: "mem::lineage",
+              payload,
+            });
+            return {
+              status_code: 200,
+              body: {
+                content: [
+                  { type: "text", text: JSON.stringify(result, null, 2) },
+                ],
+              },
+            };
+          }
+
+          case "memory_query": {
+            if (!Array.isArray(args.pipeline)) {
+              return {
+                status_code: 400,
+                body: { error: "pipeline is required for memory_query and must be an array" },
+              };
+            }
+            const payload: Record<string, unknown> = { pipeline: args.pipeline };
+            if (args.options !== undefined) {
+              // typeof [] === "object", so guard against arrays too —
+              // schema requires a plain object. CodeRabbit caught this
+              // on #574.
+              if (
+                typeof args.options !== "object" ||
+                args.options === null ||
+                Array.isArray(args.options)
+              ) {
+                return {
+                  status_code: 400,
+                  body: { error: "options must be an object" },
+                };
+              }
+              payload.options = args.options;
+            }
+            const result = await sdk.trigger({
+              function_id: "mem::query",
+              payload,
             });
             return {
               status_code: 200,
@@ -747,6 +880,26 @@ export function registerMcpEndpoints(
               body: {
                 content: [
                   { type: "text", text: JSON.stringify(nextResult, null, 2) },
+                ],
+              },
+            };
+          }
+
+          case "memory_action_get": {
+            if (typeof args.actionId !== "string" || !args.actionId) {
+              return {
+                status_code: 400,
+                body: { error: "actionId is required" },
+              };
+            }
+            const actionResult = await sdk.trigger({ function_id: "mem::action-get", payload: {
+              actionId: args.actionId,
+            } });
+            return {
+              status_code: 200,
+              body: {
+                content: [
+                  { type: "text", text: JSON.stringify(actionResult, null, 2) },
                 ],
               },
             };
@@ -1286,6 +1439,9 @@ export function registerMcpEndpoints(
           },
         };
       }
+      }),
+        ),
+      );
     },
   );
   sdk.registerTrigger({
