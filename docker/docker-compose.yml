@@ -1,0 +1,182 @@
+# Cutover compose: canonical ports (3111/3112/3113/9464/49134), bind-mount
+# to ~/.agentmemory-docker/, env injected from that dir's .env. Assumes
+# the host /opt/homebrew daemon is stopped first (pkill).
+#
+# Bring up:
+#   docker compose -f docker/docker-compose.yml up -d
+# Tear down:
+#   docker compose -f docker/docker-compose.yml down
+# Inspect:
+#   docker compose -f docker/docker-compose.yml logs -f
+#   curl http://localhost:3111/agentmemory/livez
+
+# Distinct compose project name. Both files live in docker/, so without
+# this they share the default project "docker" and `up -d` on one file
+# RECREATES the other file's container (same project + service name).
+name: agentmemory-live
+
+services:
+  agentmemory:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agentmemory-local:integrate-2026-06-10
+    container_name: agentmemory
+    restart: unless-stopped
+    labels:
+      # Watched by the autoheal sidecar below: Docker does NOT restart a
+      # container that goes `unhealthy` on its own. The silent iii-engine
+      # wedge (engine dies, parent keeps spamming reconnects, 3111 stops
+      # listening) sits dead until noticed; this label lets autoheal
+      # restart it within ~30s instead.
+      autoheal: "true"
+    user: "0:0"  # entrypoint switches to node:node via gosu
+    env_file:
+      - ~/.agentmemory-docker/.env
+    environment:
+      AGENTMEMORY_DATA_DIR: /data
+      # The viewer stays on its safe in-container 127.0.0.1:3113 bind
+      # (upstream v0.9.27 hardening: a non-loopback AGENTMEMORY_VIEWER_HOST
+      # would require AGENTMEMORY_SECRET, which would also put bearer auth
+      # on the REST API the hooks/MCP shim call). The viewer-proxy sidecar
+      # below bridges the published port to that loopback bind instead.
+    ports:
+      # Canonical ports — drop-in replacement for the /opt/homebrew daemon.
+      # Bound to 127.0.0.1 so nothing leaks to LAN.
+      - "127.0.0.1:3111:3111"   # REST + viewer-proxy target
+      - "127.0.0.1:3112:3112"   # stream WebSocket
+      # Viewer: host 3113 → in-netns socat (0.0.0.0:3213) → viewer on
+      # 127.0.0.1:3113. Ports must be published on this service because
+      # the sidecar joins this container's network namespace.
+      - "127.0.0.1:3113:3213"   # viewer HTTP via viewer-proxy
+      - "127.0.0.1:9464:9464"   # OpenTelemetry metrics
+      - "127.0.0.1:49134:49134" # iii engine
+    volumes:
+      # DB stores live in a Docker named volume (inside the VM's disk
+      # image) instead of a host bind mount, so the constant state_store.db
+      # churn no longer crosses the virtiofs host<->VM boundary — that sync
+      # was burning host CPU while the container itself sat idle. `.env`
+      # stays a host file via env_file above (compose + the host-side
+      # scripts read ~/.agentmemory-docker/.env directly; a named volume
+      # isn't reachable from the host). Populate the volume once with:
+      #   docker volume create agentmemory-data
+      #   docker run --rm -v ~/.agentmemory-docker:/src:ro \
+      #     -v agentmemory-data:/dst alpine sh -c \
+      #     'cp -a /src/state_store.db /src/stream_store /dst/'
+      - agentmemory-data:/data
+    # Hard ceiling so this container can never drive the VM into a global
+    # OOM again. History: the iii engine's RSS tracks state_store bytes and
+    # creeps with uptime; at 10GB VM / no limit it reached ~9.4GB working
+    # set, the guest kernel OOM-killed iii ~1-3x/day (mistaken for an
+    # "engine wedge"), and the resulting host swap thrash produced a
+    # watchdog panic + reboot on 2026-08-04. With a limit, a runaway hits a
+    # CONTAINER OOM-kill — bounded and auto-restarted by `restart:
+    # unless-stopped` — instead of taking the VM (and the laptop) with it.
+    # Sized ~2x the post-prune settled working set (~2GB at 82k obs /
+    # 148MB state_store, measured 2026-08-04), leaving the VM ~2GB for the
+    # guest kernel and any other container. Raise BOTH this and MemoryMiB
+    # together if the corpus is ever allowed to grow back.
+    #
+    # 2026-09-04: the corpus DID grow back. At ~130k obs / 207MB
+    # state_store + 312MB streams the settled working set is 3.6-3.7GiB,
+    # so iii was OOM-killed against the 4g cap continuously (398 SIGKILLs
+    # in the retained logs; autoheal restarting the container every ~3min).
+    # Bumped 4g -> 5g together with Docker's MemoryMiB 6144 -> 7168, which
+    # restores the ~1.3GiB of headroom the 4g cap had at 82k obs. This is a
+    # holding measure: agentmemory is moving to a 128GB Spark node, where
+    # the ceiling stops being the binding constraint. Do NOT push this
+    # higher on this laptop — the 24GB host is already swapping (~10GB of
+    # 11GB swap in use) and the Aug 4 watchdog panic came from exactly
+    # that. If it OOMs again before the migration, tighten retention
+    # (~/.agentmemory-docker/prune-30d.sh, RETAIN_DAYS=21) instead.
+    mem_limit: 5g
+    # No guest swap for this container: swapping the engine is worse than
+    # killing it — a thrashing iii wedges every request for minutes, while
+    # an OOM-kill restarts clean in ~1min at this corpus size.
+    memswap_limit: 5g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Tiny TCP relay inside agentmemory's network namespace: exposes the
+  # loopback-only viewer to the published port without weakening its bind
+  # or enabling AGENTMEMORY_SECRET. Pure byte relay — Host headers arrive
+  # unchanged as localhost:3113 / 127.0.0.1:3113, which the viewer's
+  # DNS-rebinding guard already trusts for its internal port.
+  viewer-proxy:
+    image: alpine/socat
+    container_name: agentmemory-viewer-proxy
+    restart: unless-stopped
+    network_mode: "service:agentmemory"
+    depends_on:
+      - agentmemory
+    command: ["TCP-LISTEN:3213,fork,reuseaddr,bind=0.0.0.0", "TCP:127.0.0.1:3113"]
+    labels:
+      # Watched by autoheal (same mechanism as agentmemory above), because
+      # `restart: unless-stopped` CANNOT fix this container's failure mode.
+      # When autoheal restarts agentmemory, that container keeps its ID but
+      # gets a NEW network namespace; this sidecar's `network_mode:
+      # service:agentmemory` stays attached to the OLD, dead sandbox. socat
+      # never crashes — it happily keeps listening on 3213 in a namespace
+      # nothing can reach — so PID 1 stays alive and Docker never restarts
+      # it. Symptom: host 3113 accepts the connection then closes with no
+      # bytes (ERR_EMPTY_RESPONSE, not "refused") while the viewer itself is
+      # perfectly healthy inside the container. Only a restart re-joins the
+      # live namespace. Every autoheal restart of agentmemory used to orphan
+      # the viewer silently and permanently.
+      autoheal: "true"
+    healthcheck:
+      # MUST probe 3113 (the viewer), NOT 3213 (our own listener): socat
+      # follows itself into the orphaned namespace, so 3213 answers fine
+      # there and would mask the exact failure this check exists to catch.
+      # 3113 is the viewer's loopback bind, which only exists in the LIVE
+      # namespace — unreachable once orphaned. wget (no curl in this image)
+      # so a wedged-but-listening viewer fails too.
+      test: ["CMD-SHELL", "wget -q -O /dev/null -T 3 http://127.0.0.1:3113/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Generous: the viewer binds only after agentmemory deserializes its
+      # ~490k-entry BM25 index (~3min on this corpus, measured 2026-07-15).
+      # Failures during start_period don't count, so a proxy restarted into
+      # a still-booting agentmemory waits for the bind instead of
+      # restart-looping; the first success flips it healthy.
+      start_period: 300s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # Restarts any container labelled `autoheal=true` (here: only
+  # agentmemory) when its healthcheck reports `unhealthy`. Closes the gap
+  # that left the engine dead for ~14h: Docker's `restart: unless-stopped`
+  # only fires on process EXIT, but the wedge keeps PID 1 alive, so the
+  # container never restarts itself. Scoped by label — it never touches
+  # other containers. START_PERIOD (90s) matches the engine boot so it
+  # won't restart-loop a container that's still loading its index.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: agentmemory-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "30"
+      AUTOHEAL_START_PERIOD: "90"
+      CURL_TIMEOUT: "30"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+# Pre-created + populated out of band (see the migration one-liner on the
+# agentmemory `volumes:` mount above), so `external: true` — compose
+# references it by exact name and never recreates or empties it.
+volumes:
+  agentmemory-data:
+    external: true

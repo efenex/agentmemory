@@ -1,0 +1,14 @@
+node_modules
+.git
+*.log
+data/
+data-*/
+.env
+.env.*
+test/
+docs/
+scripts/
+deploy/
+.claude/
+coverage/
+*.tsbuildinfo

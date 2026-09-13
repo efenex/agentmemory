@@ -1,0 +1,57 @@
+# Smoke-test compose: side ports (3211/3212/3213/9564/49234) so we
+# don't collide with the host's /opt/homebrew daemon on 3111. Bind-mount
+# to ~/.agentmemory-docker-smoke/ so smoke data stays separate from
+# whatever the cutover compose will use.
+#
+# Usage:
+#   cd <agentmemory-repo-root>
+#   npm run build
+#   docker compose -f docker/docker-compose.smoke.yml build
+#   docker compose -f docker/docker-compose.smoke.yml up -d
+#   curl http://localhost:3211/agentmemory/livez
+#   docker compose -f docker/docker-compose.smoke.yml logs -f
+#   # to tear down:
+#   docker compose -f docker/docker-compose.smoke.yml down
+
+# Distinct compose project name. Both files live in docker/, so without
+# this they share the default project "docker" and `up -d` on one file
+# RECREATES the other file's container (same project + service name).
+name: agentmemory-smoke
+
+services:
+  agentmemory:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agentmemory-local:smoke
+    container_name: agentmemory-smoke
+    restart: "no"
+    user: "0:0"  # entrypoint switches to node:node via gosu
+    environment:
+      # No .env injection in smoke — we want a clean, empty-state boot
+      # to verify the binary works. Real env comes in the cutover compose.
+      AGENTMEMORY_DATA_DIR: /data
+      # Viewer binds 127.0.0.1 by default; in a container that's unreachable
+      # from the published port. Override to bind all interfaces inside the
+      # container — the docker -p mapping is what restricts host exposure.
+      VIEWER_HOST: 0.0.0.0
+      # Host-header allowlist is computed from the *internal* listen port
+      # (3113), so external traffic arriving as Host: localhost:3213 hits
+      # the DNS-rebinding guard. Tell the viewer the host-mapped hostnames
+      # are also OK. Cutover compose maps port-for-port and won't need this.
+      VIEWER_ALLOWED_HOSTS: "localhost:3213,127.0.0.1:3213"
+    ports:
+      # Host:Container. All on 127.0.0.1 so this doesn't accidentally
+      # bind to LAN. Container side stays canonical; host side is +100.
+      - "127.0.0.1:3211:3111"  # REST + viewer
+      - "127.0.0.1:3212:3112"  # stream
+      - "127.0.0.1:3213:3113"  # viewer alt
+      - "127.0.0.1:9564:9464"  # metrics
+      - "127.0.0.1:49234:49134"  # iii internal
+    volumes:
+      - ~/.agentmemory-docker-smoke:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
