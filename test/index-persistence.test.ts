@@ -57,6 +57,12 @@ describe("IndexPersistence", () => {
   });
 
   it("saves and loads BM25 index round-trip", async () => {
+    // Fork (chunks-v2, audit F10a): save() yields to the event loop via
+    // setImmediate between chunk writes so a large save doesn't stall the
+    // REST accept queue. vitest's fake timers also fake setImmediate, which
+    // would stall save() forever; this test doesn't exercise timing, so run
+    // on real timers. Upstream's single-blob save has no such yield.
+    vi.useRealTimers();
     const bm25 = new SearchIndex();
     bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
 
@@ -71,6 +77,12 @@ describe("IndexPersistence", () => {
   });
 
   it("saves and loads vector index round-trip", async () => {
+    // Fork (chunks-v2, audit F10a): save() yields to the event loop via
+    // setImmediate between chunk writes so a large save doesn't stall the
+    // REST accept queue. vitest's fake timers also fake setImmediate, which
+    // would stall save() forever; this test doesn't exercise timing, so run
+    // on real timers. Upstream's single-blob save has no such yield.
+    vi.useRealTimers();
     const bm25 = new SearchIndex();
     const vector = new VectorIndex();
     vector.add("obs_1", "ses_1", new Float32Array([0.1, 0.2, 0.3]));
@@ -84,20 +96,39 @@ describe("IndexPersistence", () => {
   });
 
   it("scheduleSave debounces multiple calls", async () => {
+    // Fork (chunks-v2, audit F10a) differs from upstream in two ways:
+    // - the commit point is `bm25.meta` in mem:index:bm25 (chunks live in
+    //   mem:idx:bm25:*), not the legacy single-blob `data` key;
+    // - an empty index is never persisted (save drops chunks + meta), so
+    //   the index needs a document for the save to be observable.
     const bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
     const persistence = new IndexPersistence(kv as never, bm25, null);
+    const setSpy = vi.spyOn(kv, "set");
 
     persistence.scheduleSave();
     persistence.scheduleSave();
     persistence.scheduleSave();
 
-    await expect(kv.get("mem:index:bm25", "data")).resolves.toBeNull();
+    await expect(kv.get("mem:index:bm25", "bm25.meta")).resolves.toBeNull();
+    expect(setSpy).not.toHaveBeenCalled();
 
     vi.advanceTimersByTime(5000);
     await vi.runAllTimersAsync();
 
-    const saved = await kv.get<string>("mem:index:bm25", "data");
-    expect(saved).not.toBeNull();
+    const meta = await kv.get<{ format: string; count: number }>(
+      "mem:index:bm25",
+      "bm25.meta",
+    );
+    expect(meta).not.toBeNull();
+    expect(meta!.format).toBe("chunks-v2");
+    expect(meta!.count).toBe(1);
+    // Three scheduleSave() calls collapse into a single save: exactly one
+    // meta commit.
+    const metaWrites = setSpy.mock.calls.filter(
+      ([scope, key]) => scope === "mem:index:bm25" && key === "bm25.meta",
+    );
+    expect(metaWrites.length).toBe(1);
   });
 
   it("stop clears the pending timer", async () => {

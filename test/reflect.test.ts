@@ -69,6 +69,32 @@ function makeEdge(src: string, tgt: string): GraphEdge {
   };
 }
 
+// Fork (reflect bounded snapshot, upstream PR #1368): mem::reflect seeds
+// concept clusters from the bounded top-degree graph snapshot
+// (mem:graph:snapshot/current) instead of enumerating mem:graph:nodes and
+// mem:graph:edges, which blocked the worker on large graphs (#814). Upstream
+// tests seed the raw scopes; here the graph-cluster tests seed the snapshot.
+function seedGraphSnapshot(
+  kv: ReturnType<typeof mockKV>,
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+) {
+  return kv.set("mem:graph:snapshot", "current", {
+    version: 1,
+    topNodes: nodes,
+    topEdges: edges,
+    topDegrees: {},
+    stats: {
+      totalNodes: nodes.length,
+      totalEdges: edges.length,
+      nodesByType: {},
+      edgesByType: {},
+    },
+    updatedAt: "2026-04-01T00:00:00Z",
+    dirty: false,
+  });
+}
+
 function makeSemantic(fact: string, id?: string): SemanticMemory {
   return {
     id: id || `sem_${fact.slice(0, 8)}`,
@@ -151,11 +177,11 @@ describe("Reflect", () => {
     });
 
     it("synthesizes insights from graph concept clusters", async () => {
-      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
-      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
-      await kv.set("mem:graph:nodes", "node_testing", makeConceptNode("testing"));
-      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
-      await kv.set("mem:graph:edges", "edge_2", makeEdge("security", "testing"));
+      await seedGraphSnapshot(
+        kv,
+        [makeConceptNode("security"), makeConceptNode("validation"), makeConceptNode("testing")],
+        [makeEdge("security", "validation"), makeEdge("security", "testing")],
+      );
 
       await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
       await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
@@ -178,9 +204,11 @@ describe("Reflect", () => {
     });
 
     it("skips clusters with fewer than 3 supporting items", async () => {
-      await kv.set("mem:graph:nodes", "node_sparse", makeConceptNode("sparse"));
-      await kv.set("mem:graph:nodes", "node_topic", makeConceptNode("topic"));
-      await kv.set("mem:graph:edges", "edge_1", makeEdge("sparse", "topic"));
+      await seedGraphSnapshot(
+        kv,
+        [makeConceptNode("sparse"), makeConceptNode("topic")],
+        [makeEdge("sparse", "topic")],
+      );
       await kv.set("mem:semantic", "sem_1", makeSemantic("One sparse fact"));
 
       const result = (await sdk.trigger("mem::reflect", {})) as {
@@ -194,9 +222,11 @@ describe("Reflect", () => {
     });
 
     it("deduplicates insights by fingerprint", async () => {
-      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
-      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
-      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await seedGraphSnapshot(
+        kv,
+        [makeConceptNode("security"), makeConceptNode("validation")],
+        [makeEdge("security", "validation")],
+      );
       await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
       await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
       await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
@@ -236,9 +266,14 @@ describe("Reflect", () => {
     it("handles LLM failure gracefully", async () => {
       provider.summarize.mockRejectedValue(new Error("LLM timeout"));
 
-      await kv.set("mem:graph:nodes", "node_a", makeConceptNode("concept_a"));
-      await kv.set("mem:graph:nodes", "node_b", makeConceptNode("concept_b"));
-      await kv.set("mem:graph:edges", "edge_1", makeEdge("concept_a", "concept_b"));
+      // Seed the snapshot (see seedGraphSnapshot) so the provider failure is
+      // actually hit; seeding the raw scopes would pass vacuously via the
+      // Jaccard fallback without ever calling summarize.
+      await seedGraphSnapshot(
+        kv,
+        [makeConceptNode("concept_a"), makeConceptNode("concept_b")],
+        [makeEdge("concept_a", "concept_b")],
+      );
       await kv.set("mem:semantic", "sem_1", makeSemantic("fact about concept_a"));
       await kv.set("mem:semantic", "sem_2", makeSemantic("fact about concept_b"));
       await kv.set("mem:semantic", "sem_3", makeSemantic("concept_a and concept_b together"));
@@ -250,6 +285,7 @@ describe("Reflect", () => {
 
       expect(result.success).toBe(true);
       expect(result.newInsights).toBe(0);
+      expect(provider.summarize).toHaveBeenCalled();
     });
   });
 
