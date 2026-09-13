@@ -5,12 +5,14 @@ import type {
   Insight,
   GraphNode,
   GraphEdge,
+  GraphSnapshot,
   SemanticMemory,
   Lesson,
   Crystal,
   MemoryProvider,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { logger } from "../logger.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 
 interface ConceptCluster {
@@ -21,6 +23,31 @@ interface ConceptCluster {
   factIds: string[];
   lessonIds: string[];
   crystalIds: string[];
+}
+
+// Run `fn` over `items` with at most `limit` in flight. reflect's per-cluster
+// LLM calls are the wall-clock cost (~seconds each on local inference); doing
+// them sequentially makes the whole invocation long enough that the iii-sdk
+// recycles the worker mid-run ("Invocation stopped"). Fanning out to the
+// runtime's serving concurrency (LM Studio default 4) keeps each invocation
+// short. Order of results matches `items`.
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const runners = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    async () => {
+      for (let i = next++; i < items.length; i = next++) {
+        results[i] = await fn(items[i]);
+      }
+    },
+  );
+  await Promise.all(runners);
+  return results;
 }
 
 function reinforceInsight(insight: Insight): void {
@@ -171,14 +198,26 @@ export function registerReflectFunctions(
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
 
-      const [graphNodes, graphEdges, semanticMemories, lessons, crystals] =
+      // #814: the graph nodes/edges scopes enumerate to 8K+ heavy objects
+      // (every GraphNode carries a sourceObservationIds[] array), and the
+      // combined WS frame blocks the worker event loop long enough that the
+      // engine declares it dead — surfacing as a 500 "Invocation stopped".
+      // graph-query/graph-extract were migrated onto the bounded top-degree
+      // snapshot for exactly this failure; reflect now reads it the same way.
+      // The snapshot's top-N (500 nodes, ~230 concepts) is ample to seed
+      // higher-order clustering, and a missing/empty snapshot degrades
+      // cleanly to the jaccard fallback below (which uses semantic+lessons).
+      const [snapshot, semanticMemories, lessons, crystals] =
         await Promise.all([
-          kv.list<GraphNode>(KV.graphNodes).catch(() => []),
-          kv.list<GraphEdge>(KV.graphEdges).catch(() => []),
+          kv
+            .get<GraphSnapshot>(KV.graphSnapshot, "current")
+            .catch(() => null),
           kv.list<SemanticMemory>(KV.semantic).catch(() => []),
           kv.list<Lesson>(KV.lessons).catch(() => []),
           kv.list<Crystal>(KV.crystals).catch(() => []),
         ]);
+      const graphNodes: GraphNode[] = snapshot?.topNodes ?? [];
+      const graphEdges: GraphEdge[] = snapshot?.topEdges ?? [];
 
       let activeLessons = lessons.filter((l) => !l.deleted);
       if (data?.project) {
@@ -203,11 +242,22 @@ export function registerReflectFunctions(
       let newInsights = 0;
       let reinforced = 0;
       let clustersSkipped = 0;
-      let totalInsights = 0;
 
-      for (const conceptNames of conceptClusters) {
-        if (totalInsights >= maxTotal) break;
+      const concurrency = Math.max(
+        1,
+        parseInt(process.env["AGENTMEMORY_REFLECT_CONCURRENCY"] || "", 10) || 4,
+      );
 
+      // Each cluster is independent: build its content, synthesize, then
+      // dedup-or-create its insights. Runs fanned out at `concurrency`. The
+      // dedup (kv.get by content fingerprint) can in principle race two
+      // clusters that yield the same insight in one run, but the fingerprint
+      // is deterministic so the worst case is a duplicate create (idempotent
+      // id, last write wins) or a lost reinforcement increment — both benign.
+      const processCluster = async (
+        conceptNames: string[],
+      ): Promise<{ skipped: boolean; newInsights: number; reinforced: number }> => {
+        const outcome = { skipped: false, newInsights: 0, reinforced: 0 };
         const conceptSet = new Set(conceptNames.map((c) => c.toLowerCase()));
 
         const clusterFacts = semanticMemories.filter((s) => {
@@ -233,8 +283,8 @@ export function registerReflectFunctions(
         const totalItems =
           clusterFacts.length + clusterLessons.length + clusterCrystals.length;
         if (totalItems < 3) {
-          clustersSkipped++;
-          continue;
+          outcome.skipped = true;
+          return outcome;
         }
 
         const cluster: ConceptCluster = {
@@ -264,8 +314,7 @@ export function registerReflectFunctions(
 
           while (
             (match = insightRegex.exec(response)) !== null &&
-            clusterCount < maxInsightsPerCluster &&
-            totalInsights < maxTotal
+            clusterCount < maxInsightsPerCluster
           ) {
             const parsedConf = parseFloat(match[1]);
             const confidence = Number.isNaN(parsedConf)
@@ -282,7 +331,7 @@ export function registerReflectFunctions(
             if (existing && !existing.deleted) {
               reinforceInsight(existing);
               await kv.set(KV.insights, existing.id, existing);
-              reinforced++;
+              outcome.reinforced++;
             } else {
               const now = new Date().toISOString();
               const insight: Insight = {
@@ -302,15 +351,34 @@ export function registerReflectFunctions(
                 decayRate: 0.05,
               };
               await kv.set(KV.insights, insight.id, insight);
-              newInsights++;
+              outcome.newInsights++;
             }
 
             clusterCount++;
-            totalInsights++;
           }
-        } catch {
-          continue;
+        } catch (err) {
+          // Previously a bare `catch { continue }` — it silently swallowed
+          // every provider failure, so an over-length prompt (fast HTTP 400
+          // from the local model) or a tripped circuit breaker looked like
+          // "0 insights" with no signal. Log it so reflect failures surface.
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.warn("reflect: cluster synthesis failed", {
+            concepts: conceptNames.slice(0, 6),
+            error: msg,
+          });
         }
+        return outcome;
+      };
+
+      const outcomes = await mapWithConcurrency(
+        conceptClusters.slice(0, maxTotal),
+        concurrency,
+        processCluster,
+      );
+      for (const o of outcomes) {
+        if (o.skipped) clustersSkipped++;
+        newInsights += o.newInsights;
+        reinforced += o.reinforced;
       }
 
       try {

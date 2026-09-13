@@ -10,6 +10,10 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isAutoCompressEnabled } from "../config.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
+import {
+  hookObservationsTotal,
+  metricsEnabled,
+} from "../telemetry/prometheus.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
@@ -43,7 +47,7 @@ export function registerObserveFunction(
   dedupMap?: DedupMap,
   maxObservationsPerSession?: number,
 ): void {
-  sdk.registerFunction("mem::observe", 
+  sdk.registerFunction("mem::observe",
     async (payload: HookPayload) => {
 
       if (
@@ -59,6 +63,16 @@ export function registerObserveFunction(
           error:
             "Invalid payload: sessionId, hookType, and timestamp are required",
         };
+      }
+
+      // Hook-traffic visibility: every valid /observe POST bumps a
+      // counter labelled by hook type + project. Cardinality bound by
+      // (~12 hook types) × (~50 active projects) ≈ 600 series, fine.
+      if (metricsEnabled()) {
+        hookObservationsTotal.inc({
+          hook_type: payload.hookType,
+          project: payload.project || "unknown",
+        });
       }
 
       const obsId = generateId("obs");

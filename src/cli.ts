@@ -71,7 +71,7 @@ import { processStatIsRunning } from "./cli/process-state.js";
 import { renderSplash } from "./cli/splash.js";
 import { isFirstRun, readPrefs, resetPrefs, writePrefs } from "./cli/preferences.js";
 import { runOnboarding } from "./cli/onboarding.js";
-import { setBootVerbose } from "./logger.js";
+import { logger, setBootVerbose } from "./logger.js";
 import { hydrateProcessEnvFromFile } from "./config.js";
 import { VERSION } from "./version.js";
 import { getAllTools, ESSENTIAL_TOOLS } from "./mcp/tools-registry.js";
@@ -1483,7 +1483,21 @@ function spawnEngineBackground(
   if (!isDocker && typeof child.pid === "number") {
     writeEnginePidfile(child.pid);
   }
+  let lineBuf = "";
   child.stderr?.on("data", (chunk: Buffer) => {
+    // Forward the engine's stderr to the container log line-by-line for
+    // its whole lifetime. activeStartupStderr only covers the STARTUP
+    // window; without this, an engine crash hours later (the silent
+    // iii-engine wedge) leaves no trace in `docker logs`. Native engine
+    // only — in Docker mode this stream is the compose CLI's own.
+    if (!isDocker) {
+      lineBuf += chunk.toString("utf-8");
+      const lines = lineBuf.split("\n");
+      lineBuf = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.trim()) process.stderr.write(`[iii-engine] ${line}\n`);
+      }
+    }
     activeStartupStderr.append(chunk);
   });
   child.on("exit", (code, signal) => {
@@ -1501,6 +1515,21 @@ function spawnEngineBackground(
         binary: bin,
       };
       vlog(`engine exited early: code=${code} signal=${signal}`);
+      // Always surface an unexpected engine exit to the container log, not
+      // just under --verbose. A graceful stop sends SIGTERM/SIGINT; any
+      // other exit (crash, OOM-kill, segfault) is the silent wedge we want
+      // loud so `docker logs` shows why the engine died.
+      const graceful = signal === "SIGTERM" || signal === "SIGINT";
+      if (!isDocker && !graceful) {
+        const tail = lineBuf.trim();
+        if (tail) process.stderr.write(`[iii-engine] ${tail}\n`);
+        logger.error("iii-engine exited unexpectedly", {
+          code,
+          signal,
+          binary: bin,
+          stderrTail: stderr.trim().slice(-2000) || undefined,
+        });
+      }
       if (IS_VERBOSE && stderr.trim()) {
         p.log.error(`engine stderr:\n${stderr}`);
       }

@@ -231,33 +231,57 @@ export function registerActionsFunction(sdk: ISdk, kv: StateKV): void {
           new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
       );
 
-      const limit = data.limit || 50;
-      return { success: true, actions: actions.slice(0, limit) };
+      const limit = data.limit || 1000;
+      return { success: true, actions: actions.slice(0, limit), total: actions.length };
     },
   );
 
-  sdk.registerFunction("mem::action-get", 
+  sdk.registerFunction("mem::action-get",
     async (data: { actionId: string }) => {
       if (!data.actionId) {
         return { success: false, error: "actionId is required" };
       }
-      const action = await kv.get<Action>(KV.actions, data.actionId);
+      let action = await kv.get<Action>(KV.actions, data.actionId);
+      let resolvedFrom: string | undefined;
+
+      if (!action) {
+        const candidates = (await kv.list<Action>(KV.actions)).filter(
+          (a) => a.id === data.actionId || a.id.startsWith(`${data.actionId}_`),
+        );
+        if (candidates.length === 1) {
+          action = candidates[0];
+          resolvedFrom = data.actionId;
+        } else if (candidates.length > 1) {
+          return {
+            success: false,
+            error: "ambiguous action id prefix",
+            candidates: candidates.map((a) => a.id),
+          };
+        }
+      }
+
       if (!action) {
         return { success: false, error: "action not found" };
       }
 
+      const resolvedId = action.id;
       const allEdges = await kv.list<ActionEdge>(KV.actionEdges);
       const edges = allEdges.filter(
         (e) =>
-          e.sourceActionId === data.actionId ||
-          e.targetActionId === data.actionId,
+          e.sourceActionId === resolvedId || e.targetActionId === resolvedId,
       );
 
       const children = (await kv.list<Action>(KV.actions)).filter(
-        (a) => a.parentId === data.actionId,
+        (a) => a.parentId === resolvedId,
       );
 
-      return { success: true, action, edges, children };
+      return {
+        success: true,
+        action,
+        edges,
+        children,
+        ...(resolvedFrom ? { resolvedFrom } : {}),
+      };
     },
   );
 }

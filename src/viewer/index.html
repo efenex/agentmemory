@@ -1171,7 +1171,7 @@
       audit: { loaded: false, entries: [], opFilter: '' },
       activity: { loaded: false, observations: [], sessions: [], typeFilter: '' },
       lessons: { loaded: false, items: [], search: '', selectedId: null },
-      actions: { loaded: false, items: [], frontier: [], statusFilter: '', search: '' },
+      actions: { loaded: false, items: [], frontier: [], statusFilter: '', projectFilter: '', search: '' },
       crystals: { loaded: false, items: [], search: '', lessonMap: {} },
       profile: { loaded: false, projects: [], selectedProject: '', data: null },
       replay: { loaded: false, sessions: [], selectedId: '', timeline: null, cursor: 0, playing: false, speed: 1, timer: null, startAt: 0, offsetAt: 0 },
@@ -2773,6 +2773,8 @@
 
     function closeModal() {
       document.getElementById('modal-overlay').classList.remove('open');
+      var m = document.getElementById('modal');
+      if (m) { m.style.maxWidth = ''; m.style.maxHeight = ''; m.style.overflow = ''; }
     }
 
     async function loadTimeline() {
@@ -3420,7 +3422,16 @@
         '</div></div>';
       var search = state.actions.search.toLowerCase();
       var statusFilter = state.actions.statusFilter;
+      var projectFilter = state.actions.projectFilter;
       var frontierIds = new Set((state.actions.frontier || []).map(function(a) { return a.id; }));
+
+      // Derive the project list from the full item set BEFORE filtering,
+      // so the dropdown options stay stable across selections.
+      var projectSet = {};
+      state.actions.items.forEach(function(a) {
+        if (a.project) projectSet[a.project] = true;
+      });
+      var projects = Object.keys(projectSet).sort();
 
       if (search) {
         items = items.filter(function(a) {
@@ -3429,6 +3440,9 @@
       }
       if (statusFilter) {
         items = items.filter(function(a) { return a.status === statusFilter; });
+      }
+      if (projectFilter) {
+        items = items.filter(function(a) { return a.project === projectFilter; });
       }
 
       var html = introCard;
@@ -3440,7 +3454,15 @@
         html += '<option value="' + s + '"' + (statusFilter === s ? ' selected' : '') + '>' + s + '</option>';
       });
       html += '</select>';
-      html += '<span style="font-size:12px;color:var(--ink-faint);align-self:center;">' + items.length + ' actions</span>';
+      html += '<select id="actions-project-filter" style="padding:4px 8px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--ink);max-width:280px;" title="Filter by project">';
+      html += '<option value="">All projects</option>';
+      projects.forEach(function(p) {
+        // Show the basename so long absolute paths don't blow out the dropdown.
+        var label = p.split('/').filter(Boolean).pop() || p;
+        html += '<option value="' + esc(p) + '"' + (projectFilter === p ? ' selected' : '') + '>' + esc(label) + '</option>';
+      });
+      html += '</select>';
+      html += '<span style="font-size:12px;color:var(--ink-faint);align-self:center;">' + items.length + (items.length !== state.actions.items.length ? ' of ' + state.actions.items.length : '') + ' actions</span>';
       html += '</div>';
 
       if (items.length === 0) {
@@ -3453,15 +3475,17 @@
           '<div><a class="empty-link" href="https://github.com/rohitg00/agentmemory#actions" target="_blank" rel="noopener">Action lifecycle docs &rarr;</a></div>' +
           '</div>';
       } else {
-        html += '<table><thead><tr><th>Title</th><th>Status</th><th>Priority</th><th>Tags</th><th>Frontier</th><th>Updated</th></tr></thead><tbody>';
+        html += '<table><thead><tr><th>Title</th><th>Project</th><th>Status</th><th>Priority</th><th>Tags</th><th>Frontier</th><th>Updated</th></tr></thead><tbody>';
         items = items.slice().sort(function(a, b) { return (b.priority || 0) - (a.priority || 0); });
         items.forEach(function(a) {
           var statusClass = a.status === 'done' ? 'badge-green' : a.status === 'active' ? 'badge-blue' : a.status === 'blocked' ? 'badge-red' : a.status === 'cancelled' ? 'badge-red' : 'badge-yellow';
           var isFrontier = frontierIds.has(a.id);
-          html += '<tr' + (isFrontier ? ' style="background:rgba(45,106,79,0.08);"' : '') + '>';
+          var projectLabel = a.project ? (a.project.split('/').filter(Boolean).pop() || a.project) : '';
+          html += '<tr data-action="view-action-detail" data-action-id="' + esc(a.id) + '" title="Click for full detail" style="cursor:pointer;' + (isFrontier ? 'background:rgba(45,106,79,0.08);' : '') + '">';
           html += '<td style="max-width:350px;"><strong>' + esc(a.title) + '</strong>';
           if (a.description) html += '<div style="font-size:11px;color:var(--ink-faint);margin-top:2px;">' + esc(truncate(a.description, 80)) + '</div>';
           html += '</td>';
+          html += '<td style="font-size:11px;color:var(--ink-muted);" title="' + esc(a.project || '') + '">' + esc(projectLabel) + '</td>';
           html += '<td><span class="badge ' + statusClass + '">' + esc(a.status) + '</span></td>';
           html += '<td style="text-align:center;font-weight:600;">' + (a.priority || '-') + '</td>';
           html += '<td style="font-size:11px;color:var(--ink-muted);">' + (a.tags || []).map(esc).join(', ') + '</td>';
@@ -3478,7 +3502,65 @@
       if (__as) bindImeSafeSearch(__as, 200, function(v){ state.actions.search = v; renderActions(); });
       var __af = document.getElementById('actions-status-filter');
       if (__af) __af.addEventListener('change', function(){ state.actions.statusFilter = this.value; renderActions(); });
+      var __pf = document.getElementById('actions-project-filter');
+      if (__pf) __pf.addEventListener('change', function(){ state.actions.projectFilter = this.value; renderActions(); });
       restoreSearchFocus(__focus);
+    }
+
+    async function showActionDetail(id) {
+      var modal = document.getElementById('modal');
+      var overlay = document.getElementById('modal-overlay');
+      modal.style.maxWidth = '720px';
+      modal.style.maxHeight = '82vh';
+      modal.style.overflow = 'auto';
+      modal.innerHTML = '<div class="loading">Loading action...</div>';
+      overlay.classList.add('open');
+
+      var res = await apiGet('actions/get?actionId=' + encodeURIComponent(id));
+      if (!res || !res.success || !res.action) {
+        var msg = (res && res.error) || 'Action not found';
+        if (res && res.candidates && res.candidates.length) {
+          msg += '<br><span style="font-size:11px;">Ambiguous prefix matches: ' + res.candidates.map(esc).join(', ') + '</span>';
+        }
+        modal.innerHTML = '<h3>Action</h3><p>' + msg + '</p><div class="modal-actions"><button class="btn" data-action="close-modal">Close</button></div>';
+        return;
+      }
+
+      var a = res.action;
+      var edges = res.edges || [];
+      var children = res.children || [];
+      var frontierIds = new Set((state.actions.frontier || []).map(function(x){ return x.id; }));
+      var statusClass = a.status === 'done' ? 'badge-green' : a.status === 'active' ? 'badge-blue' : (a.status === 'blocked' || a.status === 'cancelled') ? 'badge-red' : 'badge-yellow';
+      var preStyle = 'white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.5;background:var(--bg-subtle);padding:10px;border:1px solid var(--border-light);max-height:320px;overflow:auto;margin-bottom:14px;';
+
+      var h = '<h3 style="word-break:break-word;">' + esc(a.title || '(untitled)') + '</h3>';
+      h += '<div style="font-size:11px;color:var(--ink-faint);margin-bottom:12px;font-family:var(--font-mono,monospace);word-break:break-all;">' + esc(a.id) + (a.project ? ' &middot; ' + esc(a.project) : '');
+      if (res.resolvedFrom) h += ' <span title="resolved from a truncated id">(via ' + esc(res.resolvedFrom) + ')</span>';
+      h += '</div>';
+      h += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;align-items:center;">';
+      h += '<span class="badge ' + statusClass + '">' + esc(a.status || '?') + '</span>';
+      h += '<span class="badge">P' + (a.priority || '-') + '</span>';
+      if (frontierIds.has(a.id)) h += '<span class="badge badge-blue">&#9889; frontier</span>';
+      (a.tags || []).forEach(function(t){ h += '<span class="badge">' + esc(t) + '</span>'; });
+      h += '</div>';
+      h += '<div style="font-size:11px;color:var(--ink-muted);margin-bottom:14px;">created ' + esc(shortTime(a.createdAt)) + ' &middot; updated ' + esc(shortTime(a.updatedAt)) + '</div>';
+      if (a.description) h += '<div style="font-size:12px;font-weight:600;color:var(--ink-muted);margin-bottom:4px;">Description</div><pre style="' + preStyle + '">' + esc(a.description) + '</pre>';
+      if (a.result) h += '<div style="font-size:12px;font-weight:600;color:var(--ink-muted);margin-bottom:4px;">Result</div><pre style="' + preStyle + '">' + esc(a.result) + '</pre>';
+      if (edges.length) {
+        h += '<div style="font-size:12px;font-weight:600;color:var(--ink-muted);margin-bottom:4px;">Edges (' + edges.length + ')</div><ul style="font-size:11px;color:var(--ink-muted);margin:0 0 14px 16px;padding:0;">';
+        edges.forEach(function(e){
+          var rel = e.sourceActionId === a.id ? ('&rarr; ' + esc(e.targetActionId)) : ('&larr; ' + esc(e.sourceActionId));
+          h += '<li>' + esc(e.type || 'rel') + ' ' + rel + '</li>';
+        });
+        h += '</ul>';
+      }
+      if (children.length) {
+        h += '<div style="font-size:12px;font-weight:600;color:var(--ink-muted);margin-bottom:4px;">Children (' + children.length + ')</div><ul style="font-size:11px;color:var(--ink-muted);margin:0 0 14px 16px;padding:0;">';
+        children.forEach(function(c){ h += '<li>' + esc(c.title || c.id) + ' <span style="color:var(--ink-faint);">[' + esc(c.status || '?') + ']</span></li>'; });
+        h += '</ul>';
+      }
+      h += '<div class="modal-actions"><button class="btn" data-action="close-modal">Close</button></div>';
+      modal.innerHTML = h;
     }
 
     async function loadCrystals() {
@@ -4218,6 +4300,11 @@
       if (action === 'select-session') {
         var sessionId = target.getAttribute('data-session-id');
         if (sessionId) selectSession(sessionId);
+        return;
+      }
+      if (action === 'view-action-detail') {
+        var detailActionId = target.getAttribute('data-action-id');
+        if (detailActionId) showActionDetail(detailActionId);
         return;
       }
       if (action === 'goto-tab') {

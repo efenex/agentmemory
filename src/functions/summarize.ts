@@ -16,10 +16,18 @@ import {
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
 import { SummaryOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
+import {
+  summarizeTotal,
+  summarizeChunksTotal,
+  summarizeChunkDurationMs,
+  metricsEnabled,
+} from "../telemetry/prometheus.js";
+import { withSpan } from "../telemetry/tracer.js";
 import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { detectLlmProviderKind, getEnvVar } from "../config.js";
 
 // Per-chunk observation budget when a session is too large to fit in one
 // LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
@@ -65,6 +73,29 @@ async function summarizeChunkWithRetry(
   idx: number,
   total: number,
 ): Promise<SessionSummary | null> {
+  return withSpan(
+    "summarize.chunk",
+    {
+      "agentmemory.session_id": sessionId,
+      "agentmemory.project": project,
+      "agentmemory.chunk_index": idx,
+      "agentmemory.chunk_total": total,
+      "agentmemory.chunk_size": chunk.length,
+    },
+    async (span) => summarizeChunkInner(provider, chunk, sessionId, project, idx, total, span),
+  );
+}
+
+async function summarizeChunkInner(
+  provider: MemoryProvider,
+  chunk: CompressedObservation[],
+  sessionId: string,
+  project: string,
+  idx: number,
+  total: number,
+  span: import("@opentelemetry/api").Span,
+): Promise<SessionSummary | null> {
+  const t0 = Date.now();
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const xml = await provider.summarize(
@@ -72,7 +103,18 @@ async function summarizeChunkWithRetry(
         buildSummaryPrompt(chunk),
       );
       const parsed = parseSummaryXml(xml, sessionId, project, chunk.length);
-      if (parsed) return parsed;
+      if (parsed) {
+        span.setAttribute("agentmemory.attempt", attempt);
+        span.setAttribute("agentmemory.outcome", "success");
+        if (metricsEnabled()) {
+          summarizeChunksTotal.inc({ status: "success" });
+          summarizeChunkDurationMs.observe(
+            { provider: provider.name },
+            Date.now() - t0,
+          );
+        }
+        return parsed;
+      }
       logger.warn("Summarize chunk parse failed", {
         sessionId,
         chunk: `${idx + 1}/${total}`,
@@ -86,6 +128,14 @@ async function summarizeChunkWithRetry(
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+  span.setAttribute("agentmemory.outcome", "skipped");
+  if (metricsEnabled()) {
+    summarizeChunksTotal.inc({ status: "skipped" });
+    summarizeChunkDurationMs.observe(
+      { provider: provider.name },
+      Date.now() - t0,
+    );
   }
   return null;
 }
@@ -232,13 +282,40 @@ export function registerSummarizeFunction(
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
 ): void {
-  sdk.registerFunction("mem::summarize", 
+  // Gate on the env probe, not provider.name: createProvider() always
+  // wraps the base provider in ResilientProvider, whose name is
+  // "resilient(noop)" — a call-time `name === "noop"` check never
+  // matches, so the chunk pipeline used to run against a provider that
+  // returns "" and fail every chunk. The agent-sdk opt-in counts as an
+  // LLM: with AGENTMEMORY_ALLOW_AGENT_SDK=true detectProvider() resolves
+  // agent-sdk even when no API key is set.
+  const llmDisabled =
+    detectLlmProviderKind() === "noop" &&
+    getEnvVar("AGENTMEMORY_ALLOW_AGENT_SDK") !== "true";
+
+  sdk.registerFunction("mem::summarize",
     async (data: { sessionId: string } | undefined) => {
       const startMs = Date.now();
+      const recordOutcome = (status: string): void => {
+        if (metricsEnabled()) summarizeTotal.inc({ status });
+      };
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
         return { success: false, error: "sessionId is required" };
       }
       const sessionId = data.sessionId.trim();
+
+      if (llmDisabled) {
+        logger.info("Summarize skipped — no LLM provider configured", {
+          sessionId,
+        });
+        recordOutcome("no_provider");
+        return {
+          success: false,
+          error: "no_provider",
+          reason:
+            "No LLM provider key set; Summarize is a no-op. Set ANTHROPIC_API_KEY (or GEMINI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env to enable.",
+        };
+      }
 
       const session = await kv.get<Session>(KV.sessions, sessionId);
       if (!session) {
@@ -246,6 +323,45 @@ export function registerSummarizeFunction(
           sessionId,
         });
         return { success: false, error: "session_not_found" };
+      }
+
+      // Fresh-summary dedup: Stop hooks fire summarize on every assistant
+      // turn. For chatty sessions that produce one summary every few
+      // seconds, re-running the full LLM-driven summarize is wasted work
+      // — observation deltas at sub-minute granularity rarely justify
+      // re-summarizing. If an existing summary is younger than the
+      // window below, skip without LLM work. Tunable via
+      // SUMMARIZE_DEDUP_WINDOW_MS (default 90s, set to 0 to disable).
+      const dedupRaw = process.env["SUMMARIZE_DEDUP_WINDOW_MS"];
+      const dedupWindowMs =
+        dedupRaw !== undefined && Number.isFinite(Number(dedupRaw))
+          ? Math.max(0, Number(dedupRaw))
+          : 90_000;
+      if (dedupWindowMs > 0) {
+        const existing = await kv
+          .get<SessionSummary>(KV.summaries, sessionId)
+          .catch(() => null);
+        if (existing && existing.createdAt) {
+          const ageMs = Date.now() - Date.parse(existing.createdAt);
+          if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < dedupWindowMs) {
+            logger.info("Summarize skipped — fresh summary present", {
+              sessionId,
+              ageMs,
+              dedupWindowMs,
+            });
+            const latencyMs = Date.now() - startMs;
+            if (metricsStore) {
+              await metricsStore.record("mem::summarize", latencyMs, true);
+            }
+            recordOutcome("skipped_fresh");
+            return {
+              success: true,
+              skipped: "fresh",
+              ageMs,
+              summary: existing,
+            };
+          }
+        }
       }
 
       const observations = await kv.list<CompressedObservation>(
@@ -257,19 +373,7 @@ export function registerSummarizeFunction(
         logger.info("No observations to summarize", {
           sessionId,
         });
-        return { success: false, error: "no_observations" };
-      }
-
-      if (provider.name === "noop") {
-        logger.info("Summarize skipped — no LLM provider configured", {
-          sessionId,
-        });
-        return {
-          success: false,
-          error: "no_provider",
-          reason:
-            "No LLM provider key set; Summarize is a no-op. Set ANTHROPIC_API_KEY (or GEMINI/OPENROUTER/MINIMAX) in ~/.agentmemory/.env to enable.",
-        };
+        recordOutcome("no_observations"); return { success: false, error: "no_observations" };
       }
 
       try {
@@ -318,7 +422,14 @@ export function registerSummarizeFunction(
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
-          return { success: false, error: "empty_provider_response" };
+          logger.warn("Empty provider response on summarize", {
+            sessionId,
+            provider: provider.name,
+            mode,
+            chunks,
+            observationCount: compressed.length,
+          });
+          recordOutcome("error"); return { success: false, error: "empty_provider_response" };
         }
 
         if (!summary) {
@@ -326,7 +437,10 @@ export function registerSummarizeFunction(
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
-          return { success: false, error: "parse_failed" };
+          logger.warn("Failed to parse summary XML", {
+            sessionId,
+          });
+          recordOutcome("error"); return { success: false, error: "parse_failed" };
         }
 
         const summaryForValidation = {
@@ -351,7 +465,7 @@ export function registerSummarizeFunction(
             sessionId,
             errors: validation.result.errors,
           });
-          return { success: false, error: "validation_failed" };
+          recordOutcome("error"); return { success: false, error: "validation_failed" };
         }
 
         const qualityScore = scoreSummary(summaryForValidation);
@@ -380,6 +494,9 @@ export function registerSummarizeFunction(
           valid: validation.valid,
         });
 
+        // Distinguish partial (some chunks skipped) from clean success
+        // so dashboards can spot a slow LLM provider degrading quality.
+        recordOutcome("success");
         return { success: true, summary, qualityScore };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -391,7 +508,7 @@ export function registerSummarizeFunction(
           sessionId,
           error: msg,
         });
-        return { success: false, error: msg };
+        recordOutcome("error"); return { success: false, error: msg };
       }
     },
   );

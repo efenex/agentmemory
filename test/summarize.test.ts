@@ -29,6 +29,21 @@ vi.mock("../src/functions/audit.js", () => ({
   safeAudit: vi.fn(),
 }));
 
+// The registration-time noop gate probes the merged env (including
+// ~/.agentmemory/.env on the host), so mock it for hermetic tests.
+const mockLlmConfig = vi.hoisted(() => ({
+  kind: "llm" as "llm" | "noop",
+  allowAgentSdk: false,
+}));
+
+vi.mock("../src/config.js", () => ({
+  detectLlmProviderKind: () => mockLlmConfig.kind,
+  getEnvVar: (key: string) =>
+    key === "AGENTMEMORY_ALLOW_AGENT_SDK" && mockLlmConfig.allowAgentSdk
+      ? "true"
+      : undefined,
+}));
+
 import { registerSummarizeFunction } from "../src/functions/summarize.js";
 import type {
   CompressedObservation,
@@ -152,6 +167,8 @@ describe("mem::summarize chunking", () => {
   beforeEach(() => {
     delete process.env.SUMMARIZE_CHUNK_SIZE;
     delete process.env.SUMMARIZE_CHUNK_CONCURRENCY;
+    mockLlmConfig.kind = "llm";
+    mockLlmConfig.allowAgentSdk = false;
   });
 
   afterEach(() => {
@@ -478,5 +495,45 @@ describe("mem::summarize chunking", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("parse_failed");
+  });
+});
+
+describe("mem::summarize noop gate", () => {
+  beforeEach(() => {
+    mockLlmConfig.kind = "llm";
+    mockLlmConfig.allowAgentSdk = false;
+  });
+
+  it("skips without any provider call when no LLM is configured", async () => {
+    mockLlmConfig.kind = "noop";
+    const provider = makeProvider([summaryXml({ title: "should not run" })]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_noop",
+      obsCount: 5,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_noop" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("no_provider");
+    expect(provider.calls).toHaveLength(0);
+  });
+
+  it("still summarizes when the agent-sdk fallback is opted in", async () => {
+    mockLlmConfig.kind = "noop";
+    mockLlmConfig.allowAgentSdk = true;
+    const provider = makeProvider([summaryXml({ title: "via agent-sdk" })]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_sdk",
+      obsCount: 5,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_sdk" });
+
+    expect(result.success).toBe(true);
+    expect(result.summary.title).toBe("via agent-sdk");
+    expect(provider.calls).toHaveLength(1);
   });
 });

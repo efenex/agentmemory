@@ -449,5 +449,61 @@ describe("Actions Functions", () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain("action not found");
     });
+
+    it("resolves a truncated act_<ts> prefix to the unique full id", async () => {
+      const created = (await sdk.trigger("mem::action-create", {
+        title: "Truncated lookup target",
+      })) as { success: boolean; action: Action };
+
+      // Handoffs record `act_<ts>` without the `_<rand>` suffix.
+      const truncated = created.action.id.split("_").slice(0, 2).join("_");
+      expect(truncated).not.toBe(created.action.id);
+
+      const result = (await sdk.trigger("mem::action-get", {
+        actionId: truncated,
+      })) as {
+        success: boolean;
+        action: Action;
+        resolvedFrom?: string;
+      };
+
+      expect(result.success).toBe(true);
+      expect(result.action.id).toBe(created.action.id);
+      expect(result.resolvedFrom).toBe(truncated);
+    });
+
+    it("returns candidates when a prefix is ambiguous", async () => {
+      const a = (await sdk.trigger("mem::action-create", {
+        title: "A",
+      })) as { success: boolean; action: Action };
+      const b = (await sdk.trigger("mem::action-create", {
+        title: "B",
+      })) as { success: boolean; action: Action };
+
+      // Force a shared prefix by querying with "act" (matches every action).
+      const result = (await sdk.trigger("mem::action-get", {
+        actionId: "act",
+      })) as { success: boolean; error: string; candidates: string[] };
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("ambiguous");
+      expect(result.candidates).toEqual(
+        expect.arrayContaining([a.action.id, b.action.id]),
+      );
+    });
+
+    it("does not prefix-resolve when an exact id matches", async () => {
+      const created = (await sdk.trigger("mem::action-create", {
+        title: "Exact",
+      })) as { success: boolean; action: Action };
+
+      const result = (await sdk.trigger("mem::action-get", {
+        actionId: created.action.id,
+      })) as { success: boolean; action: Action; resolvedFrom?: string };
+
+      expect(result.success).toBe(true);
+      expect(result.action.id).toBe(created.action.id);
+      expect(result.resolvedFrom).toBeUndefined();
+    });
   });
 });

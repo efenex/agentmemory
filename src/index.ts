@@ -37,6 +37,7 @@ import {
   rebuildIndex,
   getSearchIndex,
   setVectorIndex,
+  setStateKvForEmbeddings,
   setEmbeddingProvider,
   setIndexPersistence,
   setHybridRanker,
@@ -52,6 +53,8 @@ import { registerEvictFunction } from "./functions/evict.js";
 import { registerRelationsFunction } from "./functions/relations.js";
 import { registerTimelineFunction } from "./functions/timeline.js";
 import { registerSmartSearchFunction } from "./functions/smart-search.js";
+import { registerLineageFunction } from "./functions/lineage.js";
+import { registerQueryFunction } from "./functions/query.js";
 import { registerRecentSearchesSweepFunction } from "./functions/recent-searches-sweep.js";
 import { registerProfileFunction } from "./functions/profile.js";
 import { registerAutoForgetFunction } from "./functions/auto-forget.js";
@@ -92,8 +95,15 @@ import { registerRetentionFunctions } from "./functions/retention.js";
 import { registerCompressFileFunction } from "./functions/compress-file.js";
 import { registerReplayFunctions } from "./functions/replay.js";
 import { registerApiTriggers } from "./triggers/api.js";
+import { registerBackfillTriggers } from "./triggers/backfill.js";
 import { registerEventTriggers } from "./triggers/events.js";
+import { startMetricsServer } from "./triggers/metrics.js";
 import { registerMcpEndpoints } from "./mcp/server.js";
+import {
+  metricsEnabled,
+  startStorageGaugeRefresh,
+} from "./telemetry/prometheus.js";
+import { initTracer, tracingEnabled } from "./telemetry/tracer.js";
 import { getAllTools } from "./mcp/tools-registry.js";
 import { startViewerServer } from "./viewer/server.js";
 import { MetricsStore } from "./eval/metrics-store.js";
@@ -101,7 +111,7 @@ import { DedupMap } from "./functions/dedup.js";
 import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
-import { bootLog } from "./logger.js";
+import { bootLog, logger } from "./logger.js";
 import { runtimeMetadataPath } from "./runtime-paths.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
@@ -225,6 +235,7 @@ async function main() {
   const vectorIndex = embeddingProvider ? new VectorIndex() : null;
 
   setVectorIndex(vectorIndex);
+  setStateKvForEmbeddings(kv);
   setEmbeddingProvider(embeddingProvider);
 
   const meterAccessor = hasGetMeter(sdk)
@@ -243,6 +254,8 @@ async function main() {
   registerDiskSizeManager(sdk, kv);
   registerCompressFunction(sdk, kv, provider, metricsStore);
   registerSearchFunction(sdk, kv);
+  registerLineageFunction(sdk, kv);
+  registerQueryFunction(sdk, kv, provider);
   registerContextFunction(sdk, kv, config.tokenBudget);
   registerSummarizeFunction(sdk, kv, provider, metricsStore);
   registerMigrateFunction(sdk, kv);
@@ -388,8 +401,21 @@ async function main() {
   registerRecentSearchesSweepFunction(sdk, kv);
 
   registerApiTriggers(sdk, kv, secret, metricsStore, provider);
+  registerBackfillTriggers(sdk, kv, secret);
   registerEventTriggers(sdk, kv);
   registerMcpEndpoints(sdk, kv, secret);
+
+  if (metricsEnabled()) {
+    startStorageGaugeRefresh(kv, metricsStore);
+    startMetricsServer();
+    const metricsPort = process.env["AGENTMEMORY_METRICS_PORT"] || "9464";
+    bootLog(`Prometheus metrics: http://localhost:${metricsPort}/metrics`);
+  }
+
+  if (tracingEnabled()) {
+    await initTracer();
+    bootLog(`Tempo traces: ${process.env["TEMPO_OTLP_ENDPOINT"]}`);
+  }
 
   const healthMonitor = registerHealthMonitor(sdk, kv);
 
@@ -461,10 +487,36 @@ async function main() {
       bootLog(
         `Loaded persisted vector index (${vectorIndex.size} vectors)`,
       );
+      // First-boot migration: per-obs embedding store may be empty on
+      // installs upgrading from before the cheap-rebuild path. Backfill
+      // in the background so the next corrupted-state recovery doesn't
+      // need to re-embed. Fire-and-forget — never blocks boot.
+      void indexPersistence
+        .backfillEmbeddingStoreIfEmpty(vectorIndex)
+        .catch((err) => {
+          console.warn(
+            `[agentmemory] embedding-store backfill failed:`,
+            err,
+          );
+        });
     }
   }
 
   const needsRebuild = bm25Index.size === 0;
+
+  // One-line boot decision trace. Cheap, immensely useful when
+  // diagnosing why rebuild fired or didn't on a particular boot —
+  // especially the path where loaded.bm25 is a non-null SearchIndex
+  // with size=0 (chunked load saw the meta key but couldn't read any
+  // chunks; load() returned an empty index that nonetheless makes
+  // `loaded?.bm25` truthy, but `loaded.bm25.size > 0` false).
+  // See [[project-2026-05-22-vector-persistence-followups]].
+  logger.info("boot: index decision", {
+    bm25Size: bm25Index.size,
+    needsRebuild,
+    loadedBm25: loaded?.bm25 ? `SearchIndex(size=${loaded.bm25.size})` : "null",
+    loadedVectorSize: loaded?.vector?.size ?? null,
+  });
 
   if (needsRebuild) {
     // Fire-and-forget. rebuildIndex iterates every observation across
@@ -536,7 +588,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 130 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 131 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
