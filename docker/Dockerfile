@@ -1,21 +1,32 @@
-# Local-all-fixes image: bundles agentmemory's already-built dist/ from
-# this checkout (NOT the published npm package) on top of node:22-slim
-# with the pinned iii binary from iiidev/iii.
+# Local-all-fixes image: builds agentmemory's dist/ from this checkout (NOT
+# the published npm package) and bundles it on top of node:22-slim with the
+# pinned iii binary from iiidev/iii.
 #
 # Build context is the agentmemory repo root, not docker/. Run with:
 #   docker build -f docker/Dockerfile -t agentmemory-local:latest .
 #
+# Multi-stage, so a host needs only git + docker (no node): a deploy can clone
+# a pinned ref and build it as-is. Base images are pinned by multi-arch index
+# digest (valid on amd64 and arm64); bump tag and digest together.
+#
 # Pattern mirrors deploy/coolify/Dockerfile but installs our own code so
-# the running container reflects whatever's currently on local/all-fixes.
+# the running container reflects the checked-out ref.
 
 ARG III_VERSION=0.11.2
+ARG NODE_IMAGE=node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
+ARG III_IMAGE=iiidev/iii:0.11.2@sha256:15f8d4ed16c0bec350b98f4e18ed04498b1fc5ccc50585e087b736717300cf26
 
-FROM iiidev/iii:${III_VERSION} AS iii-image
+FROM ${NODE_IMAGE} AS build
+WORKDIR /src
+COPY package.json tsconfig.json tsdown.config.ts iii-config.yaml iii-config.docker.yaml docker-compose.yml ./
+COPY src/ ./src/
+RUN npm install --no-fund --no-audit --legacy-peer-deps && npm run build
 
-FROM node:22-slim
+FROM ${III_IMAGE} AS iii-image
+
+FROM ${NODE_IMAGE}
 
 ARG III_VERSION=0.11.2
-ARG III_SDK_VERSION=0.11.2
 
 # tini  — proper init so signals reach the agentmemory process
 # gosu  — drop root in the entrypoint after fixing /data perms
@@ -30,25 +41,28 @@ COPY --from=iii-image /app/iii /usr/local/bin/iii
 
 WORKDIR /opt/agentmemory
 
-# Install the production-side npm deps that aren't bundled by tsdown.
-# Use a stub package.json so we can pin iii-sdk to the EXACT version
-# matching the engine binary above. (Caret ^0.11.2 otherwise resolves
-# to 0.11.6 which needs the sandbox-everything worker model agentmemory
-# isn't refactored for yet — same constraint as deploy/coolify/Dockerfile.
-# `overrides` can't touch direct deps, so we rewrite the version pin
-# directly instead.)
+# Install the production-side npm deps that aren't bundled by tsdown, from a
+# stub package.json. The repo commits no lockfile, so the direct deps are
+# pinned to exact versions from docker/runtime-deps.json (the set verified on
+# the live deployment); a dependency missing from that file fails the build
+# rather than silently floating. iii-sdk must match the engine binary above
+# (^0.11.2 would resolve to 0.11.6, which needs the sandbox-everything worker
+# model agentmemory isn't refactored for yet — same constraint as
+# deploy/coolify/Dockerfile). Transitive deps still resolve at build time.
 COPY package.json ./agentmemory-source-package.json
+COPY docker/runtime-deps.json ./runtime-deps.json
 RUN node -e "const p=require('./agentmemory-source-package.json'); \
-    const deps=Object.assign({},p.dependencies||{}); \
-    deps['iii-sdk']='${III_SDK_VERSION}'; \
+    const pins=require('./runtime-deps.json'); \
+    const missing=Object.keys(p.dependencies||{}).filter(d=>!(d in pins)); \
+    if(missing.length){console.error('docker/runtime-deps.json lacks: '+missing.join(', '));process.exit(1);} \
+    const deps={}; for(const d of Object.keys(p.dependencies)) deps[d]=pins[d]; \
     const stub={name:'agentmemory-runtime',version:'1.0.0',private:true, \
                 dependencies:deps}; \
     require('fs').writeFileSync('package.json', JSON.stringify(stub,null,2));" \
  && npm install --omit=dev --omit=optional --no-fund --no-audit --legacy-peer-deps \
- && rm agentmemory-source-package.json
+ && rm agentmemory-source-package.json runtime-deps.json
 
-# Our pre-built dist/ (run `npm run build` on the host before docker build).
-COPY dist/ ./dist/
+COPY --from=build /src/dist/ ./dist/
 
 # Convenient `agentmemory` command, so `node /opt/agentmemory/dist/cli.mjs`
 # doesn't appear everywhere.
