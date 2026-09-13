@@ -98,7 +98,10 @@ describe("VectorIndex", () => {
     for (let n = 0; n < 5; n++) {
       const results = restored.search(vecs[n], 1);
       expect(results[0].obsId).toBe(`obs_${n}`);
-      expect(results[0].score).toBeCloseTo(1.0, 4);
+      // int8 quantization is lossy by design; identity lands within
+      // ~0.005 (not bit-exact). Dim-preservation — the actual #587
+      // guard — is asserted via validateDimensions above.
+      expect(results[0].score).toBeCloseTo(1.0, 2);
     }
   });
 
@@ -113,6 +116,7 @@ describe("VectorIndex", () => {
     const restored = VectorIndex.deserialize(index.serialize());
     const results = restored.search(new Float32Array([2, 3, 4, 5]), 1);
     expect(results[0].obsId).toBe("obs_slice");
-    expect(results[0].score).toBeCloseTo(1.0, 4);
+    // int8 quantization is lossy by design; identity lands within ~0.005.
+    expect(results[0].score).toBeCloseTo(1.0, 2);
   });
 });

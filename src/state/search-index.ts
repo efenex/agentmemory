@@ -232,6 +232,143 @@ export class SearchIndex {
     }
   }
 
+  // Chunked persistence for large corpora. The legacy serialize() above
+  // builds a single JSON string holding the whole index; at ~500k docs
+  // that string exceeds V8's max-string-length (~1 GB on x64) and save
+  // fails just like the vector index did before chunks-v1. The save path
+  // now emits three independent chunk streams (entries / inverted /
+  // docTerms) plus a meta record written last as the commit point. Each
+  // chunk targets `targetBytes` of JSON, building incrementally with a
+  // string-array + join to stay O(n) rather than O(n^2).
+  // See [[project-2026-05-22-vector-persistence-followups]] item #4.
+
+  get totalDocLengthForPersist(): number {
+    return this.totalDocLength;
+  }
+
+  setTotalDocLengthFromLoad(n: number): void {
+    this.totalDocLength = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+  }
+
+  *serializeEntriesChunks(
+    targetBytes = 16 * 1024 * 1024,
+  ): IterableIterator<{ index: number; json: string }> {
+    let buf: string[] = [];
+    let bufLen = 2; // for the surrounding []
+    let index = 0;
+    for (const [key, val] of this.entries) {
+      const itemJson = JSON.stringify([key, val]);
+      if (buf.length > 0 && bufLen + itemJson.length + 1 > targetBytes) {
+        yield { index, json: "[" + buf.join(",") + "]" };
+        index++;
+        buf = [];
+        bufLen = 2;
+      }
+      buf.push(itemJson);
+      bufLen += itemJson.length + 1;
+    }
+    if (buf.length > 0) yield { index, json: "[" + buf.join(",") + "]" };
+  }
+
+  *serializeInvertedChunks(
+    targetBytes = 16 * 1024 * 1024,
+  ): IterableIterator<{ index: number; json: string }> {
+    // One inverted entry is `[term, [obsId1, obsId2, ...]]`. Hot terms
+    // can have hundreds of thousands of postings; per-item JSON can be
+    // tens of MB on its own. The byte-size guard below catches that —
+    // we never pack multiple hot terms into one chunk.
+    let buf: string[] = [];
+    let bufLen = 2;
+    let index = 0;
+    for (const [term, ids] of this.invertedIndex) {
+      const itemJson = JSON.stringify([term, Array.from(ids)]);
+      if (buf.length > 0 && bufLen + itemJson.length + 1 > targetBytes) {
+        yield { index, json: "[" + buf.join(",") + "]" };
+        index++;
+        buf = [];
+        bufLen = 2;
+      }
+      buf.push(itemJson);
+      bufLen += itemJson.length + 1;
+    }
+    if (buf.length > 0) yield { index, json: "[" + buf.join(",") + "]" };
+  }
+
+  *serializeDocTermsChunks(
+    targetBytes = 16 * 1024 * 1024,
+  ): IterableIterator<{ index: number; json: string }> {
+    let buf: string[] = [];
+    let bufLen = 2;
+    let index = 0;
+    for (const [id, counts] of this.docTermCounts) {
+      const itemJson = JSON.stringify([id, Array.from(counts.entries())]);
+      if (buf.length > 0 && bufLen + itemJson.length + 1 > targetBytes) {
+        yield { index, json: "[" + buf.join(",") + "]" };
+        index++;
+        buf = [];
+        bufLen = 2;
+      }
+      buf.push(itemJson);
+      bufLen += itemJson.length + 1;
+    }
+    if (buf.length > 0) yield { index, json: "[" + buf.join(",") + "]" };
+  }
+
+  appendEntriesChunkJson(json: string): void {
+    let data: unknown;
+    try {
+      data = JSON.parse(json);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(data)) return;
+    for (const row of data) {
+      if (!Array.isArray(row) || row.length < 2) continue;
+      const [key, val] = row;
+      if (typeof key !== "string" || !val || typeof val !== "object") continue;
+      this.entries.set(key, val as IndexEntry);
+    }
+    this.sortedTerms = null;
+  }
+
+  appendInvertedChunkJson(json: string): void {
+    let data: unknown;
+    try {
+      data = JSON.parse(json);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(data)) return;
+    for (const row of data) {
+      if (!Array.isArray(row) || row.length < 2) continue;
+      const [term, ids] = row;
+      if (typeof term !== "string" || !Array.isArray(ids)) continue;
+      const existing = this.invertedIndex.get(term);
+      if (existing) {
+        for (const id of ids) existing.add(id);
+      } else {
+        this.invertedIndex.set(term, new Set(ids));
+      }
+    }
+    this.sortedTerms = null;
+  }
+
+  appendDocTermsChunkJson(json: string): void {
+    let data: unknown;
+    try {
+      data = JSON.parse(json);
+    } catch {
+      return;
+    }
+    if (!Array.isArray(data)) return;
+    for (const row of data) {
+      if (!Array.isArray(row) || row.length < 2) continue;
+      const [id, counts] = row;
+      if (typeof id !== "string" || !Array.isArray(counts)) continue;
+      this.docTermCounts.set(id, new Map(counts));
+    }
+  }
+
   private extractTerms(obs: CompressedObservation): string[] {
     const parts = [
       obs.title,

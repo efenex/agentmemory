@@ -4,6 +4,7 @@ import { KV } from '../state/schema.js'
 import { StateKV } from '../state/kv.js'
 import { SearchIndex } from '../state/search-index.js'
 import { VectorIndex } from '../state/vector-index.js'
+import { loadEmbeddingMap, persistEmbedding } from '../state/embedding-store.js'
 import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
@@ -13,6 +14,10 @@ import { getAgentId, isAgentScopeIsolated } from "../config.js";
 let index: SearchIndex | null = null
 let vectorIndex: VectorIndex | null = null
 let currentEmbeddingProvider: EmbeddingProvider | null = null
+// KV handle for per-obs embedding persistence. Set during boot in
+// src/index.ts alongside setVectorIndex; nullable so test harnesses and
+// the BM25-only mode don't need a stub.
+let stateKvForEmbeddings: StateKV | null = null
 
 // Hybrid ranking hook for mem::search. Wired by index.ts once the
 // hybrid searcher exists (it is constructed after this module's
@@ -57,12 +62,36 @@ export function getVectorIndex(): VectorIndex | null {
   return vectorIndex
 }
 
+export function setStateKvForEmbeddings(kv: StateKV | null): void {
+  stateKvForEmbeddings = kv
+}
+
 export function setEmbeddingProvider(provider: EmbeddingProvider | null): void {
   currentEmbeddingProvider = provider
 }
 
 export function getEmbeddingProvider(): EmbeddingProvider | null {
   return currentEmbeddingProvider
+}
+
+// Fire-and-forget per-obs embedding persistence. Logs+swallows so a
+// transient state::set failure can't break the upstream observe/compress
+// path; on next boot the chunked-load fast path still works, and the
+// per-obs store will be backfilled from in-memory the next time
+// IndexPersistence.load() runs (see embedding-store.ts).
+function persistEmbeddingBg(
+  obsId: string,
+  sessionId: string,
+  embedding: Float32Array,
+): void {
+  const kv = stateKvForEmbeddings
+  if (!kv) return
+  persistEmbedding(kv, obsId, sessionId, embedding).catch((err) => {
+    logger.warn("embedding-store: persistEmbedding failed", {
+      obsId,
+      error: err instanceof Error ? err.message : String(err),
+    })
+  })
 }
 
 export function vectorIndexRemove(id: string): void {
@@ -143,6 +172,7 @@ export async function vectorIndexAddGuarded(
       return false
     }
     vi.add(id, sessionId, embedding)
+    persistEmbeddingBg(id, sessionId, embedding)
     return true
   } catch (err) {
     logger.warn("vector-index add: embed failed — skipping", {
@@ -219,6 +249,7 @@ export async function vectorIndexAddBatchGuarded(
     }
     try {
       vi.add(item.id, item.sessionId, embedding)
+      persistEmbeddingBg(item.id, item.sessionId, embedding)
       ok++
     } catch (err) {
       logger.warn("vector-index add batch: index write failed — skipping item", {
@@ -248,6 +279,40 @@ function getRebuildEmbedBatchSize(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_REBUILD_EMBED_BATCH
 }
 
+// How many embed batches the rebuild can have in flight at once.
+// Default 1 (sequential, current behavior). Bump via
+// REBUILD_EMBED_CONCURRENCY for vLLM/Triton-backed endpoints that can
+// service multiple concurrent /v1/embeddings POSTs in parallel (e.g.
+// set vLLM `--max-num-seqs 8` and pair with concurrency=4 here).
+// Still consumed by rebuildVectorMissing() below.
+const DEFAULT_REBUILD_EMBED_CONCURRENCY = 1
+
+function getRebuildEmbedConcurrency(): number {
+  const raw = process.env.REBUILD_EMBED_CONCURRENCY
+  if (!raw) return DEFAULT_REBUILD_EMBED_CONCURRENCY
+  const n = parseInt(raw, 10)
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_REBUILD_EMBED_CONCURRENCY
+}
+
+// Reuse-store for the stored-embedding fast path, populated by
+// rebuildIndex() before it walks anything and consumed by indexRecords()
+// via enqueue(). It is module-level rather than a parameter because
+// upstream's indexRecords() is the shared entry point for the importers
+// too, and those have no StateKV to load a map from — they simply leave
+// this null and embed normally.
+//
+// The win it buys: on a populated install every observation already has a
+// persisted vector under KV.embeddings, so a rebuild becomes "one kv.list
+// plus in-memory copies" instead of hours of provider re-embeds. Entries
+// whose dimension does not match the ACTIVE provider (i.e. the provider
+// was swapped since the vector was written) deliberately miss this path
+// and fall through to a real embed, so the rebuilt index never mixes two
+// geometries.
+let rebuildEmbeddingCache: Map<string, number[]> | null = null
+let rebuildExpectedDim = 0
+let rebuildFromStore = 0
+let rebuildReembedQueued = 0
+
 // Shared BM25 + batched-vector indexing for a set of records. The full
 // rebuild and every import path (export-import, jsonl replay) funnel
 // through this so they index identically and none can silently skip the
@@ -276,7 +341,20 @@ export async function indexRecords(
   }
   const enqueue = async (job: EmbedJob): Promise<void> => {
     if (!vectorEnabled) return
+    // Fast path: vector for this obsId is already persisted under
+    // KV.embeddings — copy it into the in-memory index and skip the
+    // provider call entirely. Only ever populated on the rebuild path
+    // (see rebuildEmbeddingCache); importers leave it null.
+    if (rebuildEmbeddingCache && vectorIndex) {
+      const stored = rebuildEmbeddingCache.get(job.id)
+      if (stored && (rebuildExpectedDim === 0 || stored.length === rebuildExpectedDim)) {
+        vectorIndex.add(job.id, job.sessionId, stored)
+        rebuildFromStore++
+        return
+      }
+    }
     pending.push(job)
+    rebuildReembedQueued++
     if (pending.length >= batchSize) await flush()
   }
 
@@ -319,6 +397,29 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
   // repopulation loops run, so BM25 and vector stay in sync.
   vectorIndex?.clear()
 
+  // Populate the stored-embedding reuse cache for the duration of this
+  // rebuild. indexRecords() consults it via enqueue(); it is cleared in
+  // the finally below so importers (which share indexRecords) never see a
+  // stale map from a previous rebuild.
+  const tEmbMap = Date.now()
+  rebuildFromStore = 0
+  rebuildReembedQueued = 0
+  rebuildExpectedDim = currentEmbeddingProvider?.dimensions ?? 0
+  rebuildEmbeddingCache = vectorIndex
+    ? await loadEmbeddingMap(kv).catch((err) => {
+        logger.warn("rebuildIndex: loadEmbeddingMap failed; falling back to re-embed", {
+          error: err instanceof Error ? err.message : String(err),
+        })
+        return null
+      })
+    : null
+  logger.info("rebuildIndex: loadEmbeddingMap done", {
+    durationMs: Date.now() - tEmbMap,
+    size: rebuildEmbeddingCache?.size ?? 0,
+  })
+
+  try {
+
   // Memories live in their own KV scope outside per-session observation
   // scopes, so they need a separate walk. Without this, mem::remember
   // entries vanish from BM25 on every restart even after the live-write
@@ -334,7 +435,12 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
     })
   }
 
+  const tListStart = Date.now()
   const sessions = await kv.list<Session>(KV.sessions)
+  logger.info("rebuildIndex: kv.list(sessions) returned", {
+    durationMs: Date.now() - tListStart,
+    length: Array.isArray(sessions) ? sessions.length : null,
+  })
   const failedSessions: string[] = []
   // Index each session chunk as it loads instead of accumulating every
   // observation first, so peak memory stays bounded to one chunk.
@@ -362,10 +468,226 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
 
   indexed += await indexRecords([], memories)
   if (memoriesLoaded) memoryIndexReady = true
+
+  // How much of the rebuild came from persisted vectors vs a real
+  // provider call. This is the number to read when a rebuild is
+  // unexpectedly slow or expensive: a low fromStore means the embedding
+  // geometry changed (provider swap) and the whole corpus is re-embedding.
+  if (vectorIndex) {
+    logger.info("rebuildIndex: vector source breakdown", {
+      total: indexed,
+      fromStore: rebuildFromStore,
+      reembedQueued: rebuildReembedQueued,
+      storeAvailable: rebuildEmbeddingCache !== null,
+      storeSize: rebuildEmbeddingCache?.size ?? 0,
+    })
+  }
   return indexed
+  } finally {
+    // Always drop the map: it can hold one float array per observation
+    // (hundreds of MB at this corpus size) and indexRecords is shared
+    // with the import paths, which must not inherit it.
+    rebuildEmbeddingCache = null
+  }
+}
+
+// Targeted re-embed: walks every memory + observation and only embeds
+// rows whose obsId is NOT already in the vector index. Used to recover
+// from a transient embedding-provider failure that left a chunk of the
+// corpus un-embedded (e.g. dimension-mismatch bug that silently
+// dropped vectors for live observations between two migrations).
+//
+// Unlike rebuildIndex(), this:
+//   - does NOT clear the existing vector / BM25 indexes
+//   - skips any obsId whose vector is already present
+//   - returns a summary of what it found vs what it embedded
+//
+// Cost scales with the number of missing entries, not the total corpus.
+export async function rebuildVectorMissing(
+  kv: StateKV,
+  opts: { maxToEmbed?: number } = {},
+): Promise<{
+  checked: number;
+  attempted: number;
+  embedded: number;
+  failed: number;
+  skipped: number;
+  capped: boolean;
+}> {
+  if (!vectorIndex) {
+    return {
+      checked: 0,
+      attempted: 0,
+      embedded: 0,
+      failed: 0,
+      skipped: 0,
+      capped: false,
+    };
+  }
+  const maxToEmbed =
+    Number.isInteger(opts.maxToEmbed) && (opts.maxToEmbed as number) > 0
+      ? (opts.maxToEmbed as number)
+      : Number.MAX_SAFE_INTEGER;
+  const batchSize = getRebuildEmbedBatchSize();
+  const concurrency = getRebuildEmbedConcurrency();
+  type EmbedJob = {
+    id: string;
+    sessionId: string;
+    text: string;
+    context: { kind: "memory" | "observation" | "synthetic"; logId: string };
+  };
+  let pending: EmbedJob[] = [];
+  let checked = 0;
+  let attempted = 0;
+  let embedded = 0;
+  let failed = 0;
+  let skipped = 0;
+  // In-flight batch promises. We cap the set at `concurrency`; when
+  // full, `enqueueIfMissing` awaits `Promise.race` to free a slot
+  // before pushing the next batch — keeps memory bounded while letting
+  // the embedding endpoint service multiple POSTs simultaneously.
+  const inFlight = new Set<Promise<void>>();
+  let lastProgressAttempted = 0;
+
+  const dispatch = (batch: EmbedJob[]): void => {
+    const p = vectorIndexAddBatchGuarded(batch).then(
+      (res) => {
+        inFlight.delete(p);
+        embedded += res.ok;
+        failed += res.fail;
+        // Throttled progress: log roughly every 10 batches' worth so
+        // we don't drown stderr at high concurrency.
+        if (attempted - lastProgressAttempted >= batchSize * 10) {
+          lastProgressAttempted = attempted;
+          logger.info("rebuildVectorMissing: progress", {
+            checked,
+            attempted,
+            embedded,
+            failed,
+            skipped,
+            inFlight: inFlight.size,
+          });
+        }
+      },
+      (err) => {
+        inFlight.delete(p);
+        failed += batch.length;
+        logger.warn("rebuildVectorMissing: batch promise rejected", {
+          batchSize: batch.length,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      },
+    );
+    inFlight.add(p);
+  };
+
+  const flush = async (): Promise<void> => {
+    if (pending.length === 0) return;
+    const batch = pending;
+    pending = [];
+    dispatch(batch);
+    if (inFlight.size >= concurrency) {
+      await Promise.race(inFlight);
+    }
+  };
+  let capped = false;
+  const enqueueIfMissing = async (job: EmbedJob): Promise<void> => {
+    checked++;
+    if (vectorIndex!.has(job.id)) {
+      skipped++;
+      return;
+    }
+    if (attempted >= maxToEmbed) {
+      capped = true;
+      return;
+    }
+    attempted++;
+    pending.push(job);
+    if (pending.length >= batchSize) await flush();
+  };
+
+  try {
+    const memories = await kv.list<Memory>(KV.memories);
+    for (const memory of memories) {
+      if (capped) break;
+      if (memory.isLatest === false) continue;
+      if (!memory.title || !memory.content) continue;
+      await enqueueIfMissing({
+        id: memory.id,
+        sessionId: memory.sessionIds[0] ?? "memory",
+        text: memory.title + " " + memory.content,
+        context: { kind: "memory", logId: memory.id },
+      });
+    }
+  } catch (err) {
+    logger.warn("rebuildVectorMissing: failed to load memories", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const sessions = await kv.list<Session>(KV.sessions);
+  outer: for (let batch = 0; batch < sessions.length; batch += 10) {
+    if (capped) break;
+    const chunk = sessions.slice(batch, batch + 10);
+    const obsLists = await Promise.all(
+      chunk.map(async (s) => {
+        try {
+          return await kv.list<CompressedObservation>(KV.observations(s.id));
+        } catch {
+          return [] as CompressedObservation[];
+        }
+      }),
+    );
+    for (const observations of obsLists) {
+      for (const obs of observations) {
+        if (capped) break outer;
+        if (!obs.title || !obs.narrative) continue;
+        await enqueueIfMissing({
+          id: obs.id,
+          sessionId: obs.sessionId,
+          text: obs.title + " " + obs.narrative,
+          context: { kind: "observation", logId: obs.id },
+        });
+      }
+    }
+  }
+
+  await flush();
+  // Drain any remaining in-flight batches before reporting "done".
+  if (inFlight.size > 0) {
+    await Promise.allSettled(inFlight);
+  }
+  logger.info("rebuildVectorMissing: done", {
+    checked,
+    attempted,
+    embedded,
+    failed,
+    skipped,
+    capped,
+    concurrency,
+  });
+  return { checked, attempted, embedded, failed, skipped, capped };
 }
 
 export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
+  sdk.registerFunction(
+    "mem::vector::backfill-missing",
+    async (data: { maxToEmbed?: number } = {}): Promise<{
+      success: true;
+      checked: number;
+      attempted: number;
+      embedded: number;
+      failed: number;
+      skipped: number;
+      capped: boolean;
+    }> => {
+      const result = await rebuildVectorMissing(kv, {
+        maxToEmbed: data.maxToEmbed,
+      });
+      return { success: true, ...result };
+    },
+  );
+
   sdk.registerFunction(
     'mem::search',
     async (data: {

@@ -9,7 +9,12 @@ export const KV = {
   config: "mem:config",
   metrics: "mem:metrics",
   health: "mem:health",
-  embeddings: (obsId: string) => `mem:emb:${obsId}`,
+  // Per-observation embedding store. Single scope keyed by obsId; the
+  // value carries everything needed to rehydrate one row of the in-memory
+  // vector index. See [[project-2026-05-22-vector-persistence-followups]]
+  // — making rebuilds cheap (no re-embedding) required enumerability,
+  // which the previous `mem:emb:${obsId}` per-obs scope precluded.
+  embeddings: "mem:emb",
   bm25Index: "mem:index:bm25",
   relations: "mem:relations",
   profiles: "mem:profiles",
