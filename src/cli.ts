@@ -1864,8 +1864,8 @@ async function reconcilePersistedDockerEngine(): Promise<boolean> {
     process.exit(1);
   }
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(readyTimeoutMs()))) {
+    p.log.error(`agentmemory worker did not become ready within ${readyTimeoutMs() / 1000}s (AGENTMEMORY_READY_TIMEOUT_MS).`);
     process.exit(1);
   }
   const consoleState = await ensureIiiConsole();
@@ -1916,6 +1916,13 @@ function portInUseDiagnostic(port: number): string {
   return IS_WINDOWS
     ? `  netstat -ano | findstr :${port}`
     : `  lsof -i :${port}   # or: ss -tlnp | grep :${port}`;
+}
+
+// How long startup waits for the worker to report ready before giving up.
+// A large store boots slower than the 15 s default (fork, 2026-10-18).
+function readyTimeoutMs(): number {
+  const raw = Number(process.env["AGENTMEMORY_READY_TIMEOUT_MS"]);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15000;
 }
 
 async function waitForAgentmemoryReady(timeoutMs: number): Promise<boolean> {
@@ -2036,7 +2043,7 @@ async function main() {
   if (skipEngine) {
     if (IS_VERBOSE) p.log.info("Skipping engine check (--no-engine)");
     await import("./index.js");
-    if (await waitForAgentmemoryReady(15000)) {
+    if (await waitForAgentmemoryReady(readyTimeoutMs())) {
       const consoleState = await ensureIiiConsole();
       await maybeOfferGlobalInstall();
       printReadyHint(consoleState);
@@ -2073,8 +2080,8 @@ async function main() {
     if (detected === IIPINNED_VERSION) {
       adoptRunningEngine();
       await startWorkerForEngineState();
-      if (!(await waitForAgentmemoryReady(15000))) {
-        p.log.error("agentmemory worker did not become ready within 15s.");
+      if (!(await waitForAgentmemoryReady(readyTimeoutMs()))) {
+        p.log.error(`agentmemory worker did not become ready within ${readyTimeoutMs() / 1000}s (AGENTMEMORY_READY_TIMEOUT_MS).`);
         process.exit(1);
       }
       const consoleState = await ensureIiiConsole();
@@ -2185,8 +2192,8 @@ async function main() {
 
   s.stop(c.ok("iii-engine is ready"));
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(readyTimeoutMs()))) {
+    p.log.error(`agentmemory worker did not become ready within ${readyTimeoutMs() / 1000}s (AGENTMEMORY_READY_TIMEOUT_MS).`);
     process.exit(1);
   }
   const consoleState = await ensureIiiConsole();
@@ -3027,8 +3034,8 @@ async function startServerForDemo(): Promise<() => Promise<void>> {
   }
 
   await startWorkerForEngineState();
-  if (!(await waitForAgentmemoryReady(15000))) {
-    p.log.error("agentmemory worker did not become ready within 15s.");
+  if (!(await waitForAgentmemoryReady(readyTimeoutMs()))) {
+    p.log.error(`agentmemory worker did not become ready within ${readyTimeoutMs() / 1000}s (AGENTMEMORY_READY_TIMEOUT_MS).`);
     process.exit(1);
   }
 

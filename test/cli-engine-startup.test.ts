@@ -92,7 +92,8 @@ describe("fresh native engine startup", () => {
     expect(workerBody).toContain('await import("./index.js")');
 
     expect(source.match(/await startWorkerForEngineState\(\)/g)).toHaveLength(4);
-    expect(source).toContain("agentmemory worker did not become ready within 15s");
+    expect(source).toContain("agentmemory worker did not become ready within ${readyTimeoutMs() / 1000}s");
+    expect(source).toContain("AGENTMEMORY_READY_TIMEOUT_MS");
   });
 
   it("stores lifecycle metadata per resolved instance and scopes Docker", () => {
