@@ -22,6 +22,7 @@
     "start": "node dist/cli.mjs",
     "migrate": "node dist/functions/migrate.js",
     "pretest": "npm run build",
+    "typecheck": "tsc --noEmit -p .",
     "test": "vitest run --exclude test/integration.test.ts",
     "test:watch": "vitest --exclude test/integration.test.ts",
     "test:integration": "vitest run test/integration.test.ts",

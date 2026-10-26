@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { confinePath } from "./path-guard.js";
 import type { IIIClient } from "iii-sdk";
 import type { GraphEdge, GraphEdgeType, GraphNode, GraphNodeType } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { pinGraphState } from "../state/graph-generation.js";
 import { persistGraphDelta } from "./graph.js";

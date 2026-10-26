@@ -39,7 +39,7 @@ function hooksBlock(pluginPath: string): string {
 
 function parsePatch(content: string) {
   const doc = parseDocument(content);
-  if (doc.contents === null) doc.contents = doc.createNode([]);
+  if (doc.contents === null) doc.contents = doc.createNode([]) as unknown as typeof doc.contents;
   if (doc.errors.length || !isSeq(doc.contents)) {
     throw new Error("Cannot update dsh cordis.patch.yml: expected a valid YAML sequence.");
   }

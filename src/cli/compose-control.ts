@@ -152,7 +152,7 @@ export async function composeCall<T>(options: {
     let lastError: unknown;
     while (Date.now() < deadline) {
       try {
-        const result = await client.trigger<T & { status?: string; error?: { code?: string; message?: string } }>({
+        const result = await client.trigger<{ file: string }, T & { status?: string; error?: { code?: string; message?: string } }>({
           function_id: options.functionId,
           payload: { file: options.file },
           timeoutMs: options.timeoutMs ?? 30_000,
