@@ -18,6 +18,14 @@ function fixture() {
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("deployment entrypoint", () => {
+  it("forwards heap and fork inference settings to the application worker", () => {
+    const compose = parse(readFileSync("deploy/runtime/worker-compose.yaml", "utf8"));
+    expect(compose.containers.agentmemory.environment).toMatchObject({
+      NODE_OPTIONS: "${NODE_OPTIONS:-}",
+      AGENTMEMORY_DISABLE_THINKING: "${AGENTMEMORY_DISABLE_THINKING:-}",
+      AGENTMEMORY_METRICS_ENABLED: "${AGENTMEMORY_METRICS_ENABLED:-}",
+    });
+  });
   it.each(["2000", "500"])("generates file and Redis configurations with save interval %s", (interval) => {
     const root = fixture();
     const program = entrypoint.split("node <<'NODE'\n")[1].split("\nNODE")[0]
@@ -28,12 +36,15 @@ describe("deployment entrypoint", () => {
       execFileSync(process.execPath, ["-e", program], { env: {
         PATH: process.env.PATH, AGENTMEMORY_DATA_DIR: root,
         AGENTMEMORY_STATE_SAVE_INTERVAL_MS: interval,
+        AGENTMEMORY_READY_TIMEOUT_MS: "600000",
         REST_ALLOWED_ORIGINS: "https://viewer.example,https://other.example",
         AGENTMEMORY_STATE_BACKEND: backend, AGENTMEMORY_REDIS_URL: "redis://127.0.0.1:6379/2",
       } });
       const text = readFileSync(join(root, "worker-compose.runtime.yaml"), "utf8")
         .replaceAll("${AGENTMEMORY_STATE_SAVE_INTERVAL_MS:-2000}", interval);
       const compose = parse(text);
+      expect(compose.startup_timeout).toBe("600s");
+      expect(compose.containers.agentmemory.startup_timeout).toBe("600s");
       expect(compose.containers.state.config_override.adapter).toEqual(backend === "redis"
         ? { name: "redis", config: { redis_url: "redis://127.0.0.1:6379/2" } }
         : { name: "kv", config: { store_method: "file_based", file_path: "/data/state_store.db", save_interval_ms: interval } });

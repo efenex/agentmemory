@@ -127,6 +127,7 @@ import { registerMcpEndpoints } from "./mcp/server.js";
 import {
   metricsEnabled,
   startStorageGaugeRefresh,
+  stopStorageGaugeRefresh,
 } from "./telemetry/prometheus.js";
 import { initTracer, tracingEnabled } from "./telemetry/tracer.js";
 import { getAllTools } from "./mcp/tools-registry.js";
@@ -464,7 +465,6 @@ async function main() {
   registerMcpEndpoints(sdk, kv, secret);
 
   if (metricsEnabled()) {
-    startStorageGaugeRefresh(kv, metricsStore);
     startMetricsServer();
     const metricsPort = process.env["AGENTMEMORY_METRICS_PORT"] || "9464";
     bootLog(`Prometheus metrics: http://localhost:${metricsPort}/metrics`);
@@ -625,6 +625,7 @@ async function main() {
   bootLog(
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
+  startStorageGaugeRefresh(kv, metricsStore);
   bootLog(
     `REST API: 151 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
@@ -773,6 +774,7 @@ async function main() {
   }
 
   const shutdown = async () => {
+    stopStorageGaugeRefresh();
     console.log(`\n[agentmemory] Shutting down...`);
     const hardExit = setTimeout(async () => {
       console.warn(

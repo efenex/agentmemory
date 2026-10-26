@@ -4,6 +4,7 @@ import { KV } from "./schema.js";
 import { logger } from "../logger.js";
 import { safeAudit } from "../functions/audit.js";
 import { getIndexSaveIntervalMs, getVectorBucketSize } from "../config.js";
+import { loadVectorIndexFromStore } from "./embedding-store.js";
 
 const FAILURE_LOG_THROTTLE_MS = 60_000;
 const INDEX_PERSISTENCE_FUNCTION_ID = "mem::index-persistence";
@@ -824,6 +825,15 @@ export class IndexPersistence {
     if (!manifest.ok || !legacyKey.ok) return { vector: null, state: "unavailable", savedAt: null };
     const legacyPresent = manifest.value != null || (typeof legacyKey.value === "string" && legacyKey.value.length > 0);
     if (!legacyPresent) {
+      try {
+        const vector = await loadVectorIndexFromStore(this.kv, { strict: true });
+        if (vector) {
+          return { vector, state: "migrated", savedAt: null, expectedCount: vector.size, backfillSince: null };
+        }
+      } catch (err) {
+        logger.warn("index persistence: fork embedding recovery unavailable; preserving it", { message: errorMessage(err) });
+        return { vector: null, state: "unavailable", savedAt: null };
+      }
       await this.removeLegacyBm25Snapshot();
       return { vector: null, state: "none", savedAt: null };
     }

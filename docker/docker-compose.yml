@@ -19,8 +19,8 @@ services:
   agentmemory:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
-    image: agentmemory-local:integrate-2026-06-10
+      dockerfile: deploy/Dockerfile
+    image: agentmemory-local:integrate-2026-10-26
     container_name: agentmemory
     restart: unless-stopped
     labels:
@@ -35,6 +35,7 @@ services:
       - ~/.agentmemory-docker/.env
     environment:
       AGENTMEMORY_DATA_DIR: /data
+      AGENTMEMORY_VIEWER_HOST: 127.0.0.1
       # The viewer stays on its safe in-container 127.0.0.1:3113 bind
       # (upstream v0.9.27 hardening: a non-loopback AGENTMEMORY_VIEWER_HOST
       # would require AGENTMEMORY_SECRET, which would also put bearer auth

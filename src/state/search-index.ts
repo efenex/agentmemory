@@ -179,7 +179,7 @@ export class SearchIndex {
 
     const N = this.entries.size;
     if (N === 0) return [];
-    const avgDocLen = this.totalDocLength / N;
+    const avgDocLen = Math.max(1, this.totalDocLength / N);
 
     const queryTerms: Array<{ term: string; weight: number }> = [];
     const seen = new Set<string>();
@@ -202,11 +202,12 @@ export class SearchIndex {
     for (const { term, weight } of queryTerms) {
       const matchingDocs = this.invertedIndex.get(term);
       if (matchingDocs) {
-        const df = matchingDocs.size;
+        const df = Math.min(N, matchingDocs.size);
         const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
 
         for (const obsId of matchingDocs) {
-          const entry = this.entries.get(obsId)!;
+          const entry = this.entries.get(obsId);
+          if (!entry || !Number.isFinite(entry.termCount) || entry.termCount <= 0) continue;
           if (!matchesSearchLayer(obsId, entry.sessionId, targetLayer, entry.layer)) continue;
           const docTerms = this.docTermCounts.get(obsId);
           const tf = docTerms?.get(term) || 0;
@@ -229,12 +230,13 @@ export class SearchIndex {
         if (indexTerm === term) continue;
 
         const obsIds = this.invertedIndex.get(indexTerm)!;
-        const prefixDf = obsIds.size;
+        const prefixDf = Math.min(N, obsIds.size);
         const prefixIdf =
           Math.log((N - prefixDf + 0.5) / (prefixDf + 0.5) + 1) * 0.5;
         for (const obsId of obsIds) {
           if (matchingDocs?.has(obsId)) continue;
-          const entry = this.entries.get(obsId)!;
+          const entry = this.entries.get(obsId);
+          if (!entry || !Number.isFinite(entry.termCount) || entry.termCount <= 0) continue;
           if (!matchesSearchLayer(obsId, entry.sessionId, targetLayer, entry.layer)) continue;
           const docTerms = this.docTermCounts.get(obsId);
           const tf = docTerms?.get(indexTerm) || 0;

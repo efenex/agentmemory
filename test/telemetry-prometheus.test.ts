@@ -232,3 +232,50 @@ describe("telemetry/prometheus — metricsEnabled gate", () => {
     expect(mod.metricsEnabled()).toBe(false);
   });
 });
+
+describe("storage gauge scans", () => {
+  it("does not start overlapping scans when state reads outlast the interval", async () => {
+    vi.useFakeTimers();
+    process.env.AGENTMEMORY_METRICS_ENABLED = "true";
+    const mod = await import("../src/telemetry/prometheus.js");
+    let release!: (value: unknown[]) => void;
+    const blocked = new Promise<unknown[]>((resolve) => { release = resolve; });
+    const kv = { list: vi.fn(() => blocked), get: vi.fn(async () => null) };
+    try {
+      mod.startStorageGaugeRefresh(kv as never, undefined, 1000);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(kv.list).toHaveBeenCalledTimes(1);
+      release([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(kv.list).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(kv.list).toHaveBeenCalledTimes(6);
+    } finally {
+      release([]);
+      mod.stopStorageGaugeRefresh();
+      await vi.advanceTimersByTimeAsync(0);
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads graph totals from the bounded snapshot without listing graph records", async () => {
+    vi.useFakeTimers();
+    process.env.AGENTMEMORY_METRICS_ENABLED = "true";
+    const mod = await import("../src/telemetry/prometheus.js");
+    const kv = {
+      list: vi.fn(async () => []),
+      get: vi.fn(async () => ({ stats: { totalNodes: 2000, totalEdges: 10000 } })),
+    };
+    try {
+      mod.startStorageGaugeRefresh(kv as never, undefined, 1000);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(kv.list.mock.calls.flat()).not.toEqual(expect.arrayContaining(["mem:graph:nodes", "mem:graph:edges"]));
+      expect(kv.get).toHaveBeenCalledWith("mem:graph:snapshot", "current");
+      expect((await mod.graphNodesTotal.get()).values[0].value).toBe(2000);
+      expect((await mod.graphEdgesTotal.get()).values[0].value).toBe(10000);
+    } finally {
+      mod.stopStorageGaugeRefresh();
+      vi.useRealTimers();
+    }
+  });
+});

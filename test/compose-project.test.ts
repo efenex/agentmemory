@@ -140,6 +140,8 @@ describe("Worker Compose project", () => {
       LOKI_PUSH_URL: "http://telemetry.test/loki/api/v1/push",
       AGENTMEMORY_REFLECT_CONCURRENCY: "2",
       REBUILD_EMBED_CONCURRENCY: "2",
+      AGENTMEMORY_DISABLE_THINKING: "true",
+      AGENTMEMORY_BACKFILL_ENABLED: "true",
     };
     const { containers } = parse(renderWorkerCompose(options({ workerEnvironment })));
     expect(containers.agentmemory.environment).toMatchObject(workerEnvironment);

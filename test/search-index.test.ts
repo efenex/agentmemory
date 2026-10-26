@@ -55,6 +55,29 @@ describe("SearchIndex", () => {
     expect(index.search("database")).toEqual([]);
   });
 
+  it.each(["auth", "aut"])("ignores orphan postings while ranking %s", (query) => {
+    index.add(makeObs());
+    const snapshot = JSON.parse(index.serialize());
+    for (const [, ids] of snapshot.inverted) ids.push("missing_1", "missing_2", "missing_3");
+    const restored = SearchIndex.deserialize(JSON.stringify(snapshot));
+    const results = restored.search(query);
+    expect(results.map((r) => r.obsId)).toEqual(["obs_1"]);
+    expect(results[0].score).toBeGreaterThan(0);
+    expect(Number.isFinite(results[0].score)).toBe(true);
+  });
+
+  it("skips invalid document lengths without poisoning healthy scores", () => {
+    index.add(makeObs());
+    index.add(makeObs({ id: "obs_bad" }));
+    const snapshot = JSON.parse(index.serialize());
+    delete snapshot.entries.find(([id]: [string]) => id === "obs_bad")[1].termCount;
+    snapshot.totalDocLength = 0;
+    const restored = SearchIndex.deserialize(JSON.stringify(snapshot));
+    const results = restored.search("auth");
+    expect(results.map((r) => r.obsId)).toEqual(["obs_1"]);
+    expect(Number.isFinite(results[0].score)).toBe(true);
+  });
+
   it("scores exact matches higher than prefix matches", () => {
     index.add(
       makeObs({

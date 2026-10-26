@@ -2384,7 +2384,7 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const { scope, offset, limit } = body;
+      const { scope, offset, limit, dryRun } = body;
       if (scope !== undefined && !COMPACT_SCOPES.includes(scope as GraphCompactScope)) {
         return { status_code: 400, body: { error: "scope must be nodes, edges, history or snapshot" } };
       }
@@ -2394,10 +2394,13 @@ export function registerApiTriggers(
       if (limit !== undefined && !(Number.isInteger(limit) && (limit as number) >= 1)) {
         return { status_code: 400, body: { error: "limit must be a positive integer" } };
       }
+      if (dryRun !== undefined && typeof dryRun !== "boolean") {
+        return { status_code: 400, body: { error: "dryRun must be a boolean" } };
+      }
       try {
         const result = await sdk.trigger({
           function_id: "mem::graph-compact",
-          payload: { scope, offset, limit },
+          payload: { scope, offset, limit, ...(dryRun !== undefined ? { dryRun } : {}) },
         });
         if ((result as { success?: boolean } | null)?.success === false) {
           return { status_code: 500, body: { error: "Graph compaction failed" } };

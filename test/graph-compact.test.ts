@@ -559,6 +559,15 @@ describe("mem::graph-compact audit", () => {
     expect(r).toMatchObject({ success: true, idsRemoved: 0 });
     expect(await auditEntries(kv)).toEqual([]);
   });
+
+  it("previews trimmed provenance without changing the record or recording a mutation", async () => {
+    const kv = mockKV();
+    const original = await seedNode(kv, "gn_preview", "preview", ids("obs", 50));
+    const result = await registerCompact(kv)({ scope: "nodes", limit: 100, dryRun: true });
+    expect(result).toMatchObject({ success: true, nodesTrimmed: 1, idsRemoved: 18 });
+    expect(await kv.get("mem:graph:nodes", "gn_preview")).toEqual(original);
+    expect(await auditEntries(kv)).toEqual([]);
+  });
 });
 
 describe("api::graph-compact responses", () => {
@@ -598,6 +607,7 @@ describe("api::graph-compact responses", () => {
       { scope: "nodes", offset: "5" },
       { scope: "nodes", limit: 0 },
       { scope: "nodes", limit: "5" },
+      { scope: "nodes", dryRun: "true" },
     ]) {
       const r = await post(body);
       expect(r.status_code, JSON.stringify(body)).toBe(400);
@@ -615,6 +625,13 @@ describe("api::graph-compact responses", () => {
     expect(r.status_code).toBe(200);
     expect(seen).toEqual({ scope: "edges", offset: 0, limit: 1000 });
     expect((await post({})).status_code).toBe(200);
+  });
+
+  it("forwards the dry-run option and ignores unrecognized body fields", async () => {
+    let seen: unknown;
+    const post = await route(async (req) => { seen = req.payload; return ok(); });
+    expect((await post({ scope: "nodes", offset: 0, limit: 100, dryRun: true, unsafe: true })).status_code).toBe(200);
+    expect(seen).toEqual({ scope: "nodes", offset: 0, limit: 100, dryRun: true });
   });
 
   it("returns 500 when compaction reports its own failure, without leaking the error", async () => {

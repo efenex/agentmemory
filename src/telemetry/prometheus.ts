@@ -20,8 +20,7 @@ import type {
   Memory,
   Session,
   Lesson,
-  GraphNode,
-  GraphEdge,
+  GraphSnapshot,
 } from "../types.js";
 import { logger } from "../logger.js";
 
@@ -299,9 +298,10 @@ export async function renderMetrics(): Promise<{
 // ---------------------------------------------------------------------------
 
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
+let refreshInFlight = false;
 
 /**
- * Start a 30s refresh loop that walks KV to populate the storage gauges
+ * Start a refresh loop that walks KV to populate the storage gauges
  * (observations/memories/lessons/sessions/graph) and syncs the
  * MetricsStore's per-function aggregates into the tool_calls_total
  * counter (so historical KV-stored stats also appear in Prometheus).
@@ -329,6 +329,8 @@ export function startStorageGaugeRefresh(
     Number(process.env["AGENTMEMORY_METRICS_REFRESH_MS"] || "300000");
 
   const refresh = async (): Promise<void> => {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
     try {
       // Sessions: count by status. One KV.list — cheap.
       const sessions = await kv.list<Session>(KV.sessions).catch(() => []);
@@ -360,11 +362,11 @@ export function startStorageGaugeRefresh(
       const lessons = await kv.list<Lesson>(KV.lessons).catch(() => []);
       lessonsTotal.set(lessons.filter((l) => !l.deleted).length);
 
-      // Graph nodes/edges (single KV.list each).
-      const nodes = await kv.list<GraphNode>(KV.graphNodes).catch(() => []);
-      const edges = await kv.list<GraphEdge>(KV.graphEdges).catch(() => []);
-      graphNodesTotal.set(nodes.length);
-      graphEdgesTotal.set(edges.length);
+      const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current").catch(() => null);
+      const nodes = snapshot?.stats?.totalNodes;
+      const edges = snapshot?.stats?.totalEdges;
+      if (typeof nodes === "number" && Number.isFinite(nodes) && nodes >= 0) graphNodesTotal.set(nodes);
+      if (typeof edges === "number" && Number.isFinite(edges) && edges >= 0) graphEdgesTotal.set(edges);
 
       // MetricsStore sync: add the delta of cached per-function totals
       // into the Counter. We track which functions we've already mirrored
@@ -376,6 +378,8 @@ export function startStorageGaugeRefresh(
       logger.warn("storage gauge refresh failed", {
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      refreshInFlight = false;
     }
   };
 

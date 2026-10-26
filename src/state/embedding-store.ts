@@ -123,22 +123,20 @@ export async function removeEmbedding(
   await kv.delete(shardScope(obsId), obsId);
 }
 
-// Walk every shard and collect records into a single array. Failures on
-// individual shards are logged and skipped so a single corrupted shard
-// can't take down rebuild.
-async function listAllShardedRecords(
+async function* shardedRecords(
   kv: StateKV,
   context: string,
-): Promise<StoredEmbedding[]> {
-  const all: StoredEmbedding[] = [];
+  strict = false,
+): AsyncGenerator<StoredEmbedding> {
   let shardFailures = 0;
   for (const scope of allShardScopes()) {
     try {
       const records = await kv.list<StoredEmbedding>(scope);
       if (Array.isArray(records) && records.length > 0) {
-        for (const r of records) all.push(r);
+        for (const r of records) yield r;
       }
     } catch (err) {
+      if (strict) throw err;
       shardFailures++;
       if (shardFailures <= 3) {
         logger.warn(`embedding-store: shard list failed (${context})`, {
@@ -148,7 +146,6 @@ async function listAllShardedRecords(
       }
     }
   }
-  return all;
 }
 
 // Load the entire embedding store into a fresh VectorIndex. Returns null
@@ -156,24 +153,24 @@ async function listAllShardedRecords(
 // in-memory index (possibly empty) or to the expensive re-embed path.
 export async function loadVectorIndexFromStore(
   kv: StateKV,
+  options: { strict?: boolean } = {},
 ): Promise<VectorIndex | null> {
-  const records = await listAllShardedRecords(kv, "load");
-  if (records.length === 0) return null;
-
   const idx = new VectorIndex();
   let skipped = 0;
-  for (const r of records) {
+  for await (const r of shardedRecords(kv, "load", options.strict)) {
     if (
       !r ||
       typeof r.obsId !== "string" ||
       typeof r.sessionId !== "string" ||
       typeof r.embedding !== "string"
     ) {
+      if (options.strict) throw new Error("Malformed stored embedding record");
       skipped++;
       continue;
     }
     const emb = base64ToFloat32(r.embedding);
-    if (!emb) {
+    if (!emb || emb.length === 0 || !emb.every(Number.isFinite)) {
+      if (options.strict) throw new Error("Malformed stored embedding vector");
       skipped++;
       continue;
     }
@@ -196,12 +193,9 @@ export async function loadVectorIndexFromStore(
 export async function loadEmbeddingMap(
   kv: StateKV,
 ): Promise<Map<string, Float32Array> | null> {
-  const records = await listAllShardedRecords(kv, "loadMap");
-  if (records.length === 0) return null;
-
   const map = new Map<string, Float32Array>();
   let skipped = 0;
-  for (const r of records) {
+  for await (const r of shardedRecords(kv, "loadMap")) {
     if (
       !r ||
       typeof r.obsId !== "string" ||
@@ -235,12 +229,9 @@ export async function backfillEmbeddingStoreFromIndex(
   kv: StateKV,
   vector: VectorIndex,
 ): Promise<{ written: number; failed: number }> {
-  const internal = vector as unknown as {
-    vectors: Map<string, { embedding: Float32Array; sessionId: string }>;
-  };
   let written = 0;
   let failed = 0;
-  for (const [obsId, entry] of internal.vectors) {
+  for (const [obsId, entry] of vector.entries()) {
     try {
       await persistEmbedding(kv, obsId, entry.sessionId, entry.embedding);
       written++;

@@ -65,6 +65,11 @@ const fs = require("node:fs");
 const source = "/opt/agentmemory/worker-compose.yaml";
 const target = `${process.env.AGENTMEMORY_DATA_DIR}/worker-compose.runtime.yaml`;
 let input = fs.readFileSync(source, "utf8");
+const readyTimeout = process.env.AGENTMEMORY_READY_TIMEOUT_MS ?? "300000";
+if (!/^\d+$/.test(readyTimeout) || !Number.isSafeInteger(Number(readyTimeout)) || Number(readyTimeout) < 1 || Number(readyTimeout) > 3600000) {
+  throw new Error("AGENTMEMORY_READY_TIMEOUT_MS must be an integer between 1 and 3600000");
+}
+input = input.replaceAll("startup_timeout: 300s", `startup_timeout: ${Math.ceil(Number(readyTimeout) / 1000)}s`);
 const marker = '        allowed_origins: ["__REST_ALLOWED_ORIGINS__"]';
 if (!input.includes(marker)) throw new Error("Could not locate REST CORS allowlist marker");
 const origins = process.env.REST_ALLOWED_ORIGINS.split(",").map((origin) => origin.trim()).filter(Boolean);

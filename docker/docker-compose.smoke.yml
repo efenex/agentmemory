@@ -22,7 +22,7 @@ services:
   agentmemory:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: deploy/Dockerfile
     image: agentmemory-local:smoke
     container_name: agentmemory-smoke
     restart: "no"
@@ -34,7 +34,7 @@ services:
       # Viewer binds 127.0.0.1 by default; in a container that's unreachable
       # from the published port. Override to bind all interfaces inside the
       # container — the docker -p mapping is what restricts host exposure.
-      VIEWER_HOST: 0.0.0.0
+      AGENTMEMORY_VIEWER_HOST: 0.0.0.0
       # Host-header allowlist is computed from the *internal* listen port
       # (3113), so external traffic arriving as Host: localhost:3213 hits
       # the DNS-rebinding guard. Tell the viewer the host-mapped hostnames

@@ -971,7 +971,7 @@ export function registerGraphFunction(
       const result = await compactGraphProvenance(kv, data ?? {});
       const tookMs = Date.now() - started;
       logger.info("Graph provenance compacted", { ...result, tookMs });
-      if (result.idsRemoved > 0) {
+      if (result.idsRemoved > 0 && data?.dryRun !== true) {
         await safeAudit(kv, "graph_compact", "mem::graph-compact", [], {
           scope: data?.scope ?? "all",
           offset: data?.offset,
