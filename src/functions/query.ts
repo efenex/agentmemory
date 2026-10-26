@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import type {
   CompressedObservation,
@@ -971,7 +971,7 @@ function estimatePipelineCost(
 // ---------------------------------------------------------------------------
 
 interface ExecCtx {
-  sdk: ISdk;
+  sdk: IIIClient;
   kv: StateKV;
   provider: MemoryProvider;
   startedAt: number;
@@ -1506,7 +1506,7 @@ async function executePipeline(
 // ---------------------------------------------------------------------------
 
 export function registerQueryFunction(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
   provider: MemoryProvider,
 ): void {

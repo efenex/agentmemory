@@ -34,7 +34,7 @@ export const CORE_TOOLS: McpToolDef[] = [
   {
     name: "memory_recall",
     description:
-      "Search past session observations for relevant context. Use when you need to recall what happened in previous sessions, find past decisions, or look up how a file was modified before.",
+      "Search stored memories and session observations for relevant context. Use when you need to recall what happened in previous sessions, find past decisions, or look up how a file was modified before.",
     inputSchema: {
       type: "object",
       properties: {
@@ -52,8 +52,16 @@ export const CORE_TOOLS: McpToolDef[] = [
         },
         token_budget: {
           type: "number",
-          description: "Optional token budget to trim returned results",
+          description: "Optional estimated content token budget; response includes truncation and recovery metadata",
         },
+        targetLayer: {
+          type: "string",
+          enum: ["all", "memory", "observation"],
+          description: "Search all indexed layers (default), durable memories, or raw observations before ranking",
+        },
+        project: { type: "string", description: "Filter by project path" },
+        cwd: { type: "string", description: "Filter by session working directory" },
+        agentId: { type: "string", description: "Filter by owning agent; '*' reads across agents" },
       },
       required: ["query"],
     },
@@ -137,29 +145,49 @@ export const CORE_TOOLS: McpToolDef[] = [
       type: "object",
       properties: {
         project: { type: "string", description: "Project path to analyze" },
+        limit: {
+          type: "integer",
+          description:
+            "Most recent sessions to scan (default 50, max 500)",
+        },
       },
     },
   },
   {
     name: "memory_sessions",
     description:
-      "List recent sessions with their status and observation counts.",
-    inputSchema: { type: "object", properties: {} },
+      "List recent sessions with status, observation counts, summaries and a continuation cursor. Filters apply before pagination; retain them when requesting the next page.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project: { type: "string", description: "Exact project identifier used when sessions were started" },
+        agentId: { type: "string", description: "Filter by owning agent; '*' reads across agents" },
+        limit: { type: "integer", description: "Page size (default 20, max 100)" },
+        cursor: { type: "string", description: "nextCursor from the previous page; omit for the first page" },
+      },
+    },
   },
   {
     name: "memory_smart_search",
-    description: "Hybrid semantic+keyword search with progressive disclosure.",
+    description: "Hybrid semantic+keyword search with progressive disclosure. Pass query to search, or expandIds to recover full results.",
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string", description: "Search query" },
         expandIds: {
           type: "string",
-          description: "Comma-separated observation IDs to expand",
+          description: "Comma-separated memory or observation IDs to expand; query is optional when provided",
         },
         limit: { type: "number", description: "Max results (default 10)" },
+        targetLayer: {
+          type: "string",
+          enum: ["all", "memory", "observation"],
+          description: "Search all indexed layers (default), durable memories, or raw observations before ranking",
+        },
+        project: { type: "string", description: "Filter by project path" },
+        agentId: { type: "string", description: "Filter by owning agent; '*' reads across agents" },
+        includeLessons: { type: "boolean", description: "Include lesson matches when targetLayer is all (default true)" },
       },
-      required: ["query"],
     },
   },
   {
@@ -249,8 +277,32 @@ export const CORE_TOOLS: McpToolDef[] = [
   },
   {
     name: "memory_export",
-    description: "Export all memory data as JSON.",
-    inputSchema: { type: "object", properties: {} },
+    description:
+      "Export memory data as JSON. Past the transport size limit the export is refused, so use the paging arguments on a large store.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        maxSessions: {
+          type: "number",
+          description: "Sessions per page (with their observations)",
+        },
+        offset: { type: "number", description: "Session offset" },
+        collectionLimit: {
+          type: "number",
+          description:
+            "Rows per page for memories, summaries, graphNodes, lessons and the other top-level collections; access logs follow the memories on the page. Sessions and their observations are paged only by maxSessions and offset, so pass collections to leave them out of each page",
+        },
+        collectionOffset: {
+          type: "number",
+          description: "Row offset for the top-level collections",
+        },
+        collections: {
+          type: "string",
+          description:
+            "Comma-separated collections to return, e.g. memories,lessons. Sessions and their observations come back only when the list names sessions, access logs only together with memories. Unknown names are ignored. Omit for everything. A paged or selected export cannot be imported with strategy replace.",
+        },
+      },
+    },
   },
   {
     name: "memory_relations",
@@ -1572,8 +1624,8 @@ export function getAllTools(): McpToolDef[] {
 }
 
 // default switched from "core" (8 essential tools) to "all"
-// (full 54-tool surface). README and plugin manifests have always
-// advertised 54 tools "in proxy mode"; the old default left OpenCode /
+// (full 57-tool surface). README and plugin manifests have always
+// advertised 57 tools "in proxy mode"; the old default left OpenCode /
 // Claude Code users seeing 8 with no indication the other tools existed.
 // Users who want the lean essentials can still set AGENTMEMORY_TOOLS=core.
 export function getVisibleTools(): McpToolDef[] {

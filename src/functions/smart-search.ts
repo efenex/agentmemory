@@ -1,14 +1,21 @@
-import type { ISdk } from "iii-sdk";
+import type { GraphObservationAuthorization } from "./graph-retrieval.js";
+import type { IIIClient } from "iii-sdk";
 import type {
   CompactLessonResult,
   CompactSearchResult,
   CompressedObservation,
   HybridSearchResult,
   Lesson,
+  Memory,
 } from "../types.js";
+import { getSearchResultLayer, isSearchLayer, matchesSearchLayer, type SearchLayer, type SearchResultLayer } from "../state/search-layer.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import {
+  indexObservationSession,
+  lookupObservationSession,
+} from "../state/obs-index.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import {
   getAgentId,
@@ -16,13 +23,11 @@ import {
   getFollowupWindowSeconds,
 } from "../config.js";
 import { logger } from "../logger.js";
+import { withoutObservationSource } from "./observation-source.js";
 import { getCounters } from "../telemetry/setup.js";
+import { memoryToObservation } from "../state/memory-utils.js";
+import { getSearchIndex } from "./search.js";
 
-// #771: smart-search followup-rate diagnostic. Stored per session as
-// the most recent search payload, used to detect whether the next
-// search inside the window had a disjoint result set. sessionId is
-// duplicated into the row so the hourly sweep can delete by it
-// (StateKV.list returns values only).
 export interface RecentSearch {
   sessionId: string;
   query: string;
@@ -108,9 +113,9 @@ const NAMED_CONCEPT_TITLE_BOOST = 2.0;
 const NAMED_CONCEPT_BODY_BOOST = 1.3;
 
 export function registerSmartSearchFunction(
-  sdk: ISdk,
+  sdk: IIIClient,
   kv: StateKV,
-  searchFn: (query: string, limit: number) => Promise<HybridSearchResult[]>,
+  searchFn: (query: string, limit: number, targetLayer?: SearchLayer, authorizeGraph?: GraphObservationAuthorization) => Promise<HybridSearchResult[]>,
 ): void {
   sdk.registerFunction("mem::smart-search",
     async (data: {
@@ -119,27 +124,19 @@ export function registerSmartSearchFunction(
       limit?: number;
       project?: string;
       includeLessons?: boolean;
+      targetLayer?: SearchLayer;
       // optional per-call agent filter for runtimes routing many
       // roles through one server. "*" opts out of the env-default
       // scope and returns hits from every agent.
       agentId?: string;
-      // #771: session anchor for the followup-rate diagnostic. The
-      // API trigger fills this from req.body / headers; direct
-      // sdk.trigger callers can pass it explicitly.
       sessionId?: string;
-      // #771: marks viewer-originated searches so the diagnostic
-      // ignores them — only agent-initiated re-queries should count.
       source?: string;
     }) => {
 
-      // Compute the agent filter once, up front. Both the expandIds
-      // branch and the hybrid-search branch consult it — otherwise
-      // expandIds becomes a cross-agent leak (#554 follow-up).
-      //
-      // #817 follow-up: fail-closed when isolated mode is on AND no
-      // agent id is resolvable from any source. Silently letting
-      // filterAgentId fall through to `undefined` would be the same
-      // cross-agent leak this filter is meant to prevent.
+      if (data.targetLayer !== undefined && !isSearchLayer(data.targetLayer)) {
+        throw new Error("mem::smart-search: targetLayer must be one of 'all', 'memory', or 'observation'");
+      }
+      const targetLayer = data.targetLayer ?? "all";
       const isolated = isAgentScopeIsolated();
       const explicitAgentId =
         typeof data.agentId === "string" && data.agentId.trim().length > 0
@@ -150,6 +147,10 @@ export function registerSmartSearchFunction(
       const filterAgentId = wildcardAgent
         ? undefined
         : explicitAgentId ?? envAgentId;
+      const project =
+        typeof data.project === "string" && data.project.trim()
+          ? data.project.trim()
+          : undefined;
       if (
         isolated &&
         !wildcardAgent &&
@@ -164,12 +165,14 @@ export function registerSmartSearchFunction(
         );
       }
 
+      const matchesProject = project ? makeProjectMatcher(kv, project) : undefined;
+
       if (data.expandIds && data.expandIds.length > 0) {
-        const raw = data.expandIds.slice(0, 20);
+        const raw = data.expandIds.slice(0, 100);
         const items = raw.map((entry) => {
           if (typeof entry === "string") return { obsId: entry, sessionId: undefined as string | undefined };
-          if (entry && typeof entry === "object" && typeof (entry as any).obsId === "string") {
-            return { obsId: (entry as any).obsId, sessionId: (entry as any).sessionId as string | undefined };
+          if (entry && typeof entry === "object" && typeof entry.obsId === "string") {
+            return { obsId: entry.obsId, sessionId: typeof entry.sessionId === "string" ? entry.sessionId : undefined };
           }
           return null;
         }).filter((item): item is NonNullable<typeof item> => item !== null);
@@ -178,34 +181,40 @@ export function registerSmartSearchFunction(
           obsId: string;
           sessionId: string;
           observation: CompressedObservation;
+          layer: SearchResultLayer;
         }> = [];
 
-        const results = await Promise.all(
-          items.map(({ obsId, sessionId }) =>
-            findObservation(kv, obsId, sessionId).then((obs) =>
-              obs ? { obsId, sessionId: obs.sessionId, observation: obs } : null,
-            ),
-          ),
-        );
-        for (const r of results) {
-          if (r) expanded.push(r);
+        let attempted = 0;
+        for (let offset = 0; offset < items.length && expanded.length < 20; offset += 10) {
+          const batch = items.slice(offset, offset + 10);
+          const results = await Promise.all(batch.map(({ obsId, sessionId }) => findObservation(kv, obsId, sessionId)));
+          attempted += batch.length;
+          for (const result of results) {
+            if (!result) continue;
+            const { observation, layer } = result;
+            if (!matchesSearchLayer(observation.id, observation.sessionId, targetLayer, layer)) continue;
+            if (filterAgentId && observation.agentId !== filterAgentId) continue;
+            if (matchesProject && !await matchesProject(observation.id, observation.sessionId)) continue;
+            expanded.push({
+              obsId: observation.id,
+              sessionId: observation.sessionId,
+              observation: withoutObservationSource(observation),
+              layer,
+            });
+          }
         }
-
-        const scoped = filterAgentId
-          ? expanded.filter((e) => e.observation.agentId === filterAgentId)
-          : expanded;
+        const scoped = expanded.slice(0, 20);
 
         void recordAccessBatch(
           kv,
           scoped.map((e) => e.observation.id),
         );
 
-        const truncated = data.expandIds.length > raw.length;
+        const truncated = data.expandIds.length > raw.length || attempted < items.length || expanded.length > scoped.length;
         logger.info("Smart search expanded", {
           requested: data.expandIds.length,
-          attempted: raw.length,
+          attempted,
           returned: scoped.length,
-          filteredOutOfScope: expanded.length - scoped.length,
           truncated,
         });
         return { mode: "expanded", results: scoped, truncated };
@@ -219,75 +228,49 @@ export function registerSmartSearchFunction(
       // Lesson recall stays capped: lessons are denser than raw
       // observations so 10 covers most recall flows.
       const lessonLimit = Math.min(limit, 10);
-      const includeLessons = data.includeLessons !== false;
-
-      // Run observation hybrid-search and lesson recall in parallel so the
-      // extra lesson lookup adds no wallclock when the underlying calls
-      // can overlap. Lesson recall is best-effort: if mem::lesson-recall
-      // fails or returns unexpected shape, log + fall back to empty.
-      // Over-fetch when EITHER a named-concept query (post-rank boost
-      // needs material when BM25 mis-ranks the exact match under
-      // question-scaffolding noise) OR an agentId filter is active
-      // (hybrid search can't filter on agentId — BM25/vector indexes
-      // don't carry it — so we trim post-filter). 3×, capped at 300.
+      const includeLessons = targetLayer === "all" && data.includeLessons !== false;
       const namedConcept = extractNamedConcept(data.query);
-      const searchLimit =
-        namedConcept || filterAgentId ? Math.min(limit * 3, 300) : limit;
-      const [rawHybridResults, rawLessons] = await Promise.all([
-        searchFn(data.query, searchLimit),
+      const overFetchLimit = filterAgentId || project || namedConcept
+        ? Math.max(Math.min(limit * 10, 300), 100)
+        : limit;
+
+      const authorizeGraph: GraphObservationAuthorization = async (record, sessionId, read) => {
+        if (filterAgentId !== undefined && record.agentId !== filterAgentId) return false;
+        if (!project) return true;
+        if ("content" in record && record.project !== undefined) return record.project === project;
+        return (await read<{ project?: string }>(KV.sessions, sessionId))?.project === project;
+      };
+      const [hybridResults, lessons] = await Promise.all([
+        searchFn(data.query, overFetchLimit, targetLayer, authorizeGraph),
         includeLessons
-          ? recallLessons(sdk, data.query, lessonLimit, data.project, namedConcept ?? undefined)
+          ? recallLessons(sdk, data.query, lessonLimit, project)
           : Promise.resolve([]),
       ]);
 
-      // Filter by agentId first (hybrid indexes can't), then apply the
-      // named-concept boost on the surviving set, then trim to limit.
-      let workingHybrid = filterAgentId
-        ? rawHybridResults.filter((r) => r.observation.agentId === filterAgentId)
-        : rawHybridResults;
-      let lessons = rawLessons;
-      if (namedConcept) {
-        const phrase = namedConcept.toLowerCase();
-        const boostHybrid = (r: HybridSearchResult): HybridSearchResult => {
-          const title = (r.observation.title || "").toLowerCase();
-          const narrative = (r.observation.narrative || "").toLowerCase();
-          // Multiplicative: title AND narrative both match → 2.0 × 1.3 = 2.6×.
-          // CodeRabbit caught the prior else-if capping dual matches at 2.0×.
-          let mult = 1;
-          if (title.includes(phrase)) mult *= NAMED_CONCEPT_TITLE_BOOST;
-          if (narrative.includes(phrase)) mult *= NAMED_CONCEPT_BODY_BOOST;
-          return mult === 1 ? r : { ...r, combinedScore: r.combinedScore * mult };
-        };
-        workingHybrid = workingHybrid
-          .map(boostHybrid)
-          .sort((a, b) => b.combinedScore - a.combinedScore);
-        // Use boostMatched (set by recallLessons against the full
-        // pre-truncation content) instead of re-scanning the 240-char
-        // preview here. Falls back to scanning preview if boostMatched
-        // is absent (recallLessons called without boostPhrase).
-        lessons = rawLessons
-          .map((l) => {
-            const matched =
-              (l as CompactLessonResult & { boostMatched?: boolean }).boostMatched === true ||
-              (typeof l.content === "string" && l.content.toLowerCase().includes(phrase));
-            if (!matched) return l;
-            return { ...l, score: (l.score ?? 0) * NAMED_CONCEPT_TITLE_BOOST };
-          })
-          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-        logger.info("Smart search named-concept boost applied", {
-          query: data.query,
-          concept: namedConcept,
-          boostedHybrid: workingHybrid.filter((r) => {
-            const t = (r.observation.title || "").toLowerCase();
-            const n = (r.observation.narrative || "").toLowerCase();
-            return t.includes(phrase) || n.includes(phrase);
-          }).length,
-        });
-      }
-      const hybridResults = workingHybrid.slice(0, limit);
+      const layerResults = hybridResults.filter((result) => matchesSearchLayer(
+        result.observation.id,
+        result.sessionId,
+        targetLayer,
+        result.layer ?? getSearchIndex().layerOf(result.observation.id),
+      ));
+      const projectResults = matchesProject
+        ? await filterProjectResults(layerResults, (result) => matchesProject(result.observation.id, result.sessionId))
+        : layerResults;
 
-      const compact: CompactSearchResult[] = hybridResults.map((r) => ({
+      const scopedHybrid = filterAgentId
+        ? projectResults.filter((r) => r.observation.agentId === filterAgentId)
+        : projectResults;
+      const filteredHybrid = (namedConcept ? scopedHybrid.map((r) => ({
+        ...r,
+        combinedScore: r.combinedScore * (
+          r.observation.title.toLowerCase().includes(namedConcept.toLowerCase()) ? NAMED_CONCEPT_TITLE_BOOST :
+          r.observation.narrative.toLowerCase().includes(namedConcept.toLowerCase()) ? NAMED_CONCEPT_BODY_BOOST : 1
+        ),
+      })).sort((a, b) => b.combinedScore - a.combinedScore) : scopedHybrid).slice(0, limit);
+
+      const compact: CompactSearchResult[] = filteredHybrid.map((r) => ({
         obsId: r.observation.id,
+        layer: r.layer ?? getSearchIndex().layerOf(r.observation.id) ?? getSearchResultLayer(r.observation.id, r.sessionId),
         sessionId: r.sessionId,
         title: r.observation.title,
         type: r.observation.type,
@@ -300,13 +283,6 @@ export function registerSmartSearchFunction(
         compact.map((r) => r.obsId),
       );
 
-      // #771: followup-rate diagnostic. Only fires for agent-initiated
-      // searches that carry a sessionId — viewer-originated searches
-      // (source === "viewer") and direct-sdk callers without a session
-      // anchor are skipped. The result-set comparison uses obsIds: a
-      // disjoint set under the window suggests the previous call's
-      // results were not used, which is our directional proxy for
-      // reader-failure-with-evidence.
       if (
         data.sessionId &&
         typeof data.sessionId === "string" &&
@@ -365,7 +341,7 @@ export function registerSmartSearchFunction(
 }
 
 async function recallLessons(
-  sdk: ISdk,
+  sdk: IIIClient,
   query: string,
   limit: number,
   project?: string,
@@ -451,12 +427,23 @@ async function findObservation(
   kv: StateKV,
   obsId: string,
   sessionIdHint?: string,
-): Promise<CompressedObservation | null> {
+): Promise<{ observation: CompressedObservation; layer: SearchResultLayer } | null> {
+  const memory = await kv.get<Memory>(KV.memories, obsId);
+  if (memory) return { observation: memoryToObservation(memory), layer: "memory" };
+
   if (sessionIdHint) {
     const obs = await kv
       .get<CompressedObservation>(KV.observations(sessionIdHint), obsId)
       .catch(() => null);
-    if (obs) return obs;
+    if (obs) return { observation: obs, layer: "observation" };
+  }
+
+  const indexedSessionId = await lookupObservationSession(kv, obsId);
+  if (indexedSessionId) {
+    const obs = await kv
+      .get<CompressedObservation>(KV.observations(indexedSessionId), obsId)
+      .catch(() => null);
+    if (obs) return { observation: obs, layer: "observation" };
   }
 
   const sessions = await kv.list<{ id: string }>(KV.sessions);
@@ -467,8 +454,44 @@ async function findObservation(
         kv.get<CompressedObservation>(KV.observations(s.id), obsId).catch(() => null),
       ),
     );
-    const found = results.find((r) => r !== null);
-    if (found) return found;
+    const foundIndex = results.findIndex((r) => r !== null);
+    if (foundIndex !== -1) {
+      const found = results[foundIndex] as CompressedObservation;
+      await indexObservationSession(kv, obsId, batch[foundIndex].id).catch(
+        () => {},
+      );
+      return { observation: found, layer: "observation" };
+    }
   }
   return null;
+}
+
+function makeProjectMatcher(kv: StateKV, project: string): (obsId: string, sessionId: string) => Promise<boolean> {
+  const memories = new Map<string, Promise<Memory | null>>();
+  const sessions = new Map<string, Promise<{ project?: string } | null>>();
+  return async (obsId, sessionId) => {
+    let memoryRead = memories.get(obsId);
+    if (!memoryRead) {
+      memoryRead = kv.get<Memory>(KV.memories, obsId);
+      memories.set(obsId, memoryRead);
+    }
+    const memory = await memoryRead;
+    if (memory?.project !== undefined) return memory.project === project;
+    let sessionRead = sessions.get(sessionId);
+    if (!sessionRead) {
+      sessionRead = kv.get<{ project?: string }>(KV.sessions, sessionId);
+      sessions.set(sessionId, sessionRead);
+    }
+    return (await sessionRead)?.project === project;
+  };
+}
+
+async function filterProjectResults<T>(items: T[], matches: (item: T) => Promise<boolean>): Promise<T[]> {
+  const scoped: T[] = [];
+  for (let offset = 0; offset < items.length; offset += 10) {
+    const batch = items.slice(offset, offset + 10);
+    const selected = await Promise.all(batch.map(matches));
+    scoped.push(...batch.filter((_, index) => selected[index]));
+  }
+  return scoped;
 }

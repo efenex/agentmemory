@@ -1,3 +1,5 @@
+import { matchesSearchLayer, type SearchLayer, type SearchLayerResolver } from "./search-layer.js";
+
 // Int8 scalar quantization helpers. Stored vectors are int8 arrays plus
 // a per-vector float scale; reconstructed value f[i] ≈ q[i] * scale.
 //
@@ -44,6 +46,12 @@ function quantizeNormalized(arr: Float32Array): { q: Int8Array; scale: number } 
   return { q, scale: maxAbs / 127 };
 }
 
+export function float32ToBase64(arr: Float32Array): string {
+  return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength).toString(
+    "base64",
+  );
+}
+
 function int8ToBase64(arr: Int8Array): string {
   return Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength).toString(
     "base64",
@@ -61,7 +69,7 @@ function base64ToInt8(b64: string): Int8Array {
 // Float32 base64 — kept for back-compat with `chunks-v2` (pre-quant) on-disk
 // snapshots. Loader detects the format from the record shape and dequantizes
 // → re-quantizes into the new in-memory representation.
-function base64ToFloat32(b64: string): Float32Array {
+export function base64ToFloat32(b64: string): Float32Array {
   const buf = Buffer.from(b64, "base64");
   const copy = new ArrayBuffer(buf.byteLength);
   Buffer.from(copy).set(buf);
@@ -92,26 +100,94 @@ interface QuantizedEntry {
   sessionId: string;
 }
 
+export type VectorEntry = { embedding: Float32Array; sessionId: string };
+
+export type VectorChangeListener = (obsId: string | null, entry: VectorEntry | null) => void;
+
 export class VectorIndex {
   private vectors: Map<string, QuantizedEntry> = new Map();
 
+  private changes: Map<string, boolean> = new Map();
+  private listener: VectorChangeListener | null = null;
+
+  setChangeListener(listener: VectorChangeListener | null): void {
+    this.listener = listener;
+  }
+
   add(obsId: string, sessionId: string, embedding: Float32Array): void {
+    const entry = { embedding, sessionId };
     const { q, scale } = quantizeNormalized(embedding);
     this.vectors.set(obsId, { quantized: q, scale, sessionId });
+    this.changes.set(obsId, true);
+    this.listener?.(obsId, entry);
   }
 
   remove(obsId: string): void {
-    this.vectors.delete(obsId);
+    if (this.vectors.delete(obsId)) {
+      this.changes.set(obsId, false);
+      this.listener?.(obsId, null);
+    }
   }
 
   has(obsId: string): boolean {
     return this.vectors.has(obsId);
   }
 
+  get(obsId: string): VectorEntry | undefined {
+    const entry = this.vectors.get(obsId);
+    return entry ? { embedding: Float32Array.from(entry.quantized, n => n * entry.scale), sessionId: entry.sessionId } : undefined;
+  }
+
+  getQuantized(obsId: string): { embedding: string; scale: number; sessionId: string } | undefined {
+    const entry = this.vectors.get(obsId);
+    return entry ? { embedding: int8ToBase64(entry.quantized), scale: entry.scale, sessionId: entry.sessionId } : undefined;
+  }
+
+  loadQuantized(obsId: string, sessionId: string, embedding: string, scale: number): void {
+    if (!Number.isFinite(scale) || scale < 0) throw new Error("Invalid vector scale");
+    this.vectors.set(obsId, { quantized: base64ToInt8(embedding), scale, sessionId });
+  }
+
+  *entries(): IterableIterator<[string, VectorEntry]> {
+    for (const id of this.vectors.keys()) yield [id, this.get(id)!];
+  }
+
+  loadPersisted(obsId: string, sessionId: string, embedding: Float32Array): void {
+    const { q, scale } = quantizeNormalized(embedding);
+    this.vectors.set(obsId, { quantized: q, scale, sessionId });
+  }
+
+  get pendingChanges(): number {
+    return this.changes.size;
+  }
+
+  takeChanges(): Map<string, boolean> {
+    const taken = this.changes;
+    this.changes = new Map();
+    return taken;
+  }
+
+  returnChanges(changes: Map<string, boolean>): void {
+    for (const [obsId, present] of changes) {
+      if (!this.changes.has(obsId)) this.changes.set(obsId, present);
+    }
+  }
+
+  markRemoved(obsId: string): void {
+    if (!this.vectors.has(obsId)) this.changes.set(obsId, false);
+  }
+
+  markAllChanged(): void {
+    for (const obsId of this.vectors.keys()) this.changes.set(obsId, true);
+  }
+
   search(
     query: Float32Array,
     limit = 20,
+    targetLayer: SearchLayer = "all",
+    resolveLayer?: SearchLayerResolver,
   ): Array<{ obsId: string; sessionId: string; score: number }> {
+    if (limit <= 0) return [];
     const { q: queryQ, scale: queryScale } = quantizeNormalized(query);
 
     const results: Array<{
@@ -122,6 +198,7 @@ export class VectorIndex {
     let minScore = -Infinity;
 
     for (const [obsId, entry] of this.vectors) {
+      if (!matchesSearchLayer(obsId, entry.sessionId, targetLayer, resolveLayer?.(obsId, entry.sessionId))) continue;
       if (entry.quantized.length !== queryQ.length) continue;
       // Zero entries (or a zero query) score 0 against everything — match
       // the legacy cosineSimilarity contract which returned 0 for
@@ -175,11 +252,15 @@ export class VectorIndex {
   }
 
   clear(): void {
+    const hadVectors = this.vectors.size > 0;
+    for (const obsId of this.vectors.keys()) this.changes.set(obsId, false);
     this.vectors.clear();
+    if (hadVectors) this.listener?.(null, null);
   }
 
   restoreFrom(other: VectorIndex): void {
-    const src = (other as any).vectors as Map<string, QuantizedEntry>;
+    const src = other.vectors;
+    this.changes = new Map(other.changes);
     this.vectors = new Map();
     for (const [obsId, entry] of src) {
       this.vectors.set(obsId, {

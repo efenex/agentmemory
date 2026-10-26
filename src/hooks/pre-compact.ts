@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { resolveClientSecret } from "../secret-store.js";
+import { preCompactBudget } from "./_capture-filter.js";
 import { resolveProject, hookCwd } from "./_project.js";
 
 import { newTraceparent } from "./_traceparent.js";
@@ -9,7 +11,7 @@ function isSdkChildContext(payload: unknown): boolean {
 }
 
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
-const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
+const SECRET = resolveClientSecret(REST_URL);
 
 function authHeaders(): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json", "traceparent": newTraceparent() };
@@ -49,11 +51,14 @@ async function main() {
     }
   }
 
+  const budget = preCompactBudget();
+  if (budget === 0) return;
+
   try {
     const res = await fetch(`${REST_URL}/agentmemory/context`, {
       method: "POST",
       headers: authHeaders(),
-      body: JSON.stringify({ sessionId, project, budget: 1500 }),
+      body: JSON.stringify({ sessionId, project, budget }),
       signal: AbortSignal.timeout(5000),
     });
 

@@ -140,6 +140,7 @@ async function setupHandler(opts: {
   sessionId: string;
   obsCount: number;
   provider: MemoryProvider;
+  metricsStore?: unknown;
 }) {
   const sdk = mockSdk();
   const kv = mockKV();
@@ -156,7 +157,7 @@ async function setupHandler(opts: {
     const o = makeObs(i, opts.sessionId);
     await kv.set(`obs:${opts.sessionId}`, o.id, o);
   }
-  registerSummarizeFunction(sdk as any, kv as any, opts.provider);
+  registerSummarizeFunction(sdk as any, kv as any, opts.provider, opts.metricsStore as any);
   const handler = sdk.functions.get("mem::summarize")!;
   return { handler, kv };
 }
@@ -432,10 +433,6 @@ describe("mem::summarize chunking", () => {
     expect(maxInflight).toBe(2);
   });
 
-  // #783: markdown-wrapped XML used to silently fail parsing because
-  // the tag regex looked for <title> in the raw payload. stripXmlWrappers
-  // now peels ```xml ... ``` fences and conversational pre/postamble
-  // before the regex runs.
   it("parses a summary even when the LLM wraps XML in markdown fences", async () => {
     const wrappedXml = "Here's the summary:\n```xml\n" + summaryXml({
       title: "wrapped",
@@ -498,42 +495,21 @@ describe("mem::summarize chunking", () => {
   });
 });
 
-describe("mem::summarize noop gate", () => {
-  beforeEach(() => {
-    mockLlmConfig.kind = "llm";
-    mockLlmConfig.allowAgentSdk = false;
-  });
-
-  it("skips without any provider call when no LLM is configured", async () => {
-    mockLlmConfig.kind = "noop";
-    const provider = makeProvider([summaryXml({ title: "should not run" })]);
+describe("mem::summarize without an LLM provider", () => {
+  it("skips a wrapped noop provider without recording a failed call", async () => {
+    const { ResilientProvider } = await import("../src/providers/resilient.js");
+    const { NoopProvider } = await import("../src/providers/noop.js");
+    const record = vi.fn(async () => {});
     const { handler } = await setupHandler({
       sessionId: "ses_noop",
-      obsCount: 5,
-      provider,
+      obsCount: 3,
+      provider: new ResilientProvider(new NoopProvider()),
+      metricsStore: { record },
     });
 
-    const result: any = await handler({ sessionId: "ses_noop" });
+    const result = (await handler({ sessionId: "ses_noop" })) as { success: boolean; error?: string };
 
-    expect(result.success).toBe(false);
-    expect(result.error).toBe("no_provider");
-    expect(provider.calls).toHaveLength(0);
-  });
-
-  it("still summarizes when the agent-sdk fallback is opted in", async () => {
-    mockLlmConfig.kind = "noop";
-    mockLlmConfig.allowAgentSdk = true;
-    const provider = makeProvider([summaryXml({ title: "via agent-sdk" })]);
-    const { handler } = await setupHandler({
-      sessionId: "ses_sdk",
-      obsCount: 5,
-      provider,
-    });
-
-    const result: any = await handler({ sessionId: "ses_sdk" });
-
-    expect(result.success).toBe(true);
-    expect(result.summary.title).toBe("via agent-sdk");
-    expect(provider.calls).toHaveLength(1);
+    expect(result).toMatchObject({ success: false, error: "no_provider" });
+    expect(record).not.toHaveBeenCalled();
   });
 });

@@ -71,17 +71,12 @@ export async function initTracer(): Promise<AnyTracerProvider | null> {
     headers,
   });
 
-  // @opentelemetry/resources 1.30.x exposes the legacy `Resource` class
-  // constructor; 2.x renamed to `resourceFromAttributes`. We're pinned
-  // to 1.30 to match iii-sdk's OTel deps, so use the class shape.
-  const Resource = (resources as { Resource: new (attrs: Record<string, string>) => unknown })
-    .Resource;
   const serviceNameAttr =
     (semconv as { ATTR_SERVICE_NAME?: string }).ATTR_SERVICE_NAME ||
     "service.name";
 
   provider = new NodeTracerProvider({
-    resource: new Resource({ [serviceNameAttr]: serviceName }),
+    resource: resources.resourceFromAttributes({ [serviceNameAttr]: serviceName }),
     spanProcessors: [new BatchSpanProcessor(exporter)],
   });
   // NOTE: no .register() — that would clobber iii-sdk's global provider.
@@ -168,7 +163,7 @@ export function spanContextInfo(span: Span): {
  * traceparent / tracestate / baggage.
  */
 export function extractParentContext(
-  headers: Record<string, string | undefined> | undefined,
+  headers: Record<string, string | string[] | undefined> | undefined,
 ): Context {
   if (!headers) return contextApi.active();
   // Normalize header keys to lowercase — Node HTTP delivers them that

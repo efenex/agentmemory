@@ -1,4 +1,4 @@
-import type { ISdk } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
 import type {
   CompressedObservation,
   GraphEdge,
@@ -96,7 +96,7 @@ function tieBreak(a: TimelineItem, b: TimelineItem): number {
   return 0;
 }
 
-export function registerLineageFunction(sdk: ISdk, kv: StateKV): void {
+export function registerLineageFunction(sdk: IIIClient, kv: StateKV): void {
   sdk.registerFunction(
     "mem::lineage",
     async (data: LineageRequest): Promise<LineageResult | { error: string }> => {

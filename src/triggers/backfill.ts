@@ -19,7 +19,8 @@
 //   - Auth: piggybacks the standard checkAuth() if AGENTMEMORY_AUTH_SECRET
 //     is set in the daemon env
 
-import type { ISdk, ApiRequest } from "iii-sdk";
+import type { IIIClient } from "iii-sdk";
+import type { HttpRequest } from "@iii-dev/helpers/http";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import type {
@@ -62,7 +63,7 @@ function backfillEnabled(): boolean {
 }
 
 function checkAuth(
-  req: ApiRequest,
+  req: HttpRequest,
   secret: string | undefined,
 ): Response | null {
   if (!secret) return null;
@@ -93,11 +94,11 @@ function asStringArray(v: unknown): string[] {
   return v.filter((x): x is string => typeof x === "string" && x.length > 0);
 }
 
-export function registerBackfillTriggers(sdk: ISdk, kv: StateKV, secret?: string): void {
+export function registerBackfillTriggers(sdk: IIIClient, kv: StateKV, secret?: string): void {
   // ---------- POST /agentmemory/backfill/session ----------
   sdk.registerFunction(
     "api::backfill::session",
-    async (req: ApiRequest): Promise<Response> => {
+    async (req: HttpRequest): Promise<Response> => {
       if (!backfillEnabled()) return disabledResponse();
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
@@ -147,7 +148,7 @@ export function registerBackfillTriggers(sdk: ISdk, kv: StateKV, secret?: string
   // ---------- POST /agentmemory/backfill/observation ----------
   sdk.registerFunction(
     "api::backfill::observation",
-    async (req: ApiRequest): Promise<Response> => {
+    async (req: HttpRequest): Promise<Response> => {
       if (!backfillEnabled()) return disabledResponse();
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
@@ -233,7 +234,7 @@ export function registerBackfillTriggers(sdk: ISdk, kv: StateKV, secret?: string
   // missing entries, not the total corpus.
   sdk.registerFunction(
     "api::backfill::vectors-missing",
-    async (req: ApiRequest): Promise<Response> => {
+    async (req: HttpRequest): Promise<Response> => {
       if (!backfillEnabled()) return disabledResponse();
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
@@ -269,7 +270,7 @@ export function registerBackfillTriggers(sdk: ISdk, kv: StateKV, secret?: string
   // ---------- POST /agentmemory/backfill/summary ----------
   sdk.registerFunction(
     "api::backfill::summary",
-    async (req: ApiRequest): Promise<Response> => {
+    async (req: HttpRequest): Promise<Response> => {
       if (!backfillEnabled()) return disabledResponse();
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
