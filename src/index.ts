@@ -35,6 +35,7 @@ import { registerCompressFunction } from "./functions/compress.js";
 import {
   registerSearchFunction,
   rebuildIndex,
+  markMemoryIndexReady,
   getSearchIndex,
   setVectorIndex,
   setStateKvForEmbeddings,
@@ -538,6 +539,12 @@ async function main() {
         console.warn(`[agentmemory] Failed to rebuild search index:`, err);
       });
   } else {
+    // A restored, non-empty BM25 index already covers memories saved since
+    // 0.9.5 (every mem::remember indexes at save time). Mark it ready before
+    // the backfill below: rebuildIndex is the only other place that sets the
+    // flag and it never runs on this path, so without this every
+    // mem::remember falls back to a full memories-scope scan.
+    markMemoryIndexReady();
     // Backfill memories into BM25 for users upgrading from <0.9.5: prior
     // versions of mem::remember never indexed memories, so the persisted
     // BM25 covers observations only and `memory_smart_search` returns

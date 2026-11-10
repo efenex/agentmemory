@@ -19,6 +19,9 @@ function safeSlice(text: string, length: number): string {
   return /[\uD800-\uDBFF]$/.test(sliced) ? sliced.slice(0, -1) : sliced;
 }
 
+const COLD_SCAN_BACKOFF_MS = 10 * 60 * 1000;
+let coldScanBackoffUntil = 0;
+
 export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::remember", 
     async (data: {
@@ -77,7 +80,8 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         // falls back to the full scan so supersession never silently
         // stops working.
         const idx = getSearchIndex();
-        let candidateMemories: Memory[];
+        let candidateMemories: Memory[] = [];
+        let scanned = false;
         try {
           if (isMemoryIndexReady() && idx.size > 0) {
             // 50 hits, not 20: the shared index also holds observations,
@@ -94,16 +98,21 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
               ),
             );
             candidateMemories = loaded.filter((m): m is Memory => m !== null);
-          } else {
+          } else if (Date.now() >= coldScanBackoffUntil) {
+            scanned = true;
             candidateMemories = await kv.list<Memory>(KV.memories);
           }
         } catch (err) {
           // Candidate generation is an optimization; a failure here must
-          // never block the save itself.
-          logger.warn("supersession candidate lookup failed, using full scan", {
+          // never block the save itself, and must not retry the same scan:
+          // on a large file-backed store a state::list can run past the
+          // engine invocation timeout, and a second scan (or a scan per
+          // queued save) keeps the engine thread pinned. Save without
+          // supersession and stop cold scans for a while.
+          if (scanned) coldScanBackoffUntil = Date.now() + COLD_SCAN_BACKOFF_MS;
+          logger.warn("supersession candidate lookup failed, saving without supersession", {
             error: err instanceof Error ? err.message : JSON.stringify(err),
           });
-          candidateMemories = await kv.list<Memory>(KV.memories);
         }
         let supersededId: string | undefined;
         let supersededVersion = 1;
