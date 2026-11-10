@@ -49,6 +49,10 @@ export function isMemoryIndexReady(): boolean {
   return memoryIndexReady
 }
 
+export function markMemoryIndexReady(): void {
+  memoryIndexReady = true
+}
+
 export function getSearchIndex(): SearchIndex {
   if (!index) index = new SearchIndex()
   return index
