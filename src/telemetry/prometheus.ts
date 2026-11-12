@@ -29,6 +29,7 @@ import type {
   GraphEdge,
 } from "../types.js";
 import { logger } from "../logger.js";
+import { isMemoryIndexReady } from "../functions/search.js";
 
 const PREFIX = "agentmemory_";
 
@@ -306,9 +307,16 @@ export async function renderMetrics(): Promise<{
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 
 const failingScopes = new Set<string>();
+let bootTickSkipped = false;
+let refreshNow: (() => Promise<void>) | undefined;
 
 export function resetStorageGaugeFailureState(): void {
   failingScopes.clear();
+  bootTickSkipped = false;
+}
+
+export function requestStorageGaugeRefresh(): void {
+  if (refreshNow) void refreshNow();
 }
 
 function noteScopeResult(scope: string, err?: unknown): void {
@@ -341,6 +349,10 @@ async function listForGauge<T>(
 }
 
 async function loadMemoriesForGauge(kv: StateKV): Promise<Memory[] | null> {
+  if (!isMemoryIndexReady() && !bootTickSkipped) {
+    bootTickSkipped = true;
+    return null;
+  }
   const viaIndex = await listMemoriesViaIndex(kv);
   if (viaIndex) return viaIndex;
   if (coldScanBackedOff()) return null;
@@ -357,6 +369,8 @@ async function loadMemoriesForGauge(kv: StateKV): Promise<Memory[] | null> {
  * place (logged once per outage) instead of resetting to an empty gauge.
  * Memories are counted from the BM25 index ids (bounded kv.get batches)
  * when the index is ready, falling back to one full-scope list otherwise.
+ * The first tick before the index is ready skips memories (no scan at
+ * boot); index.ts calls requestStorageGaugeRefresh() once it is ready.
  */
 export async function refreshStorageGauges(
   kv: StateKV,
@@ -449,6 +463,7 @@ export function startStorageGaugeRefresh(
     Number(process.env["AGENTMEMORY_METRICS_REFRESH_MS"] || "300000");
 
   const refresh = () => refreshStorageGauges(kv, metricsStore);
+  refreshNow = refresh;
 
   void refresh();
   refreshTimer = setInterval(() => void refresh(), ms);

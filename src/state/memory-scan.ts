@@ -27,8 +27,9 @@ export function resetColdScanBackoff(): void {
  * the engine. Walks the BM25 index's mem_ ids and loads them with bounded
  * parallel kv.get batches.
  *
- * Returns null when the index is not ready or empty (no cheap path
- * available). Memories the index does not cover (not yet backfilled, or
+ * Returns null when the index is not ready or holds no mem_ ids (no
+ * cheap path available; callers must not treat that as "zero memories").
+ * Memories the index does not cover (not yet backfilled, or
  * superseded revisions) are not returned, so the result is a lower bound
  * on the memories scope. Stale index ids resolve to null and are skipped.
  */
@@ -38,6 +39,7 @@ export async function listMemoriesViaIndex(
   const idx = getSearchIndex();
   if (!isMemoryIndexReady() || idx.size === 0) return null;
   const ids = idx.ids().filter((id) => id.startsWith(MEMORY_ID_PREFIX));
+  if (ids.length === 0) return null;
   const memories: Memory[] = [];
   for (let start = 0; start < ids.length; start += GET_BATCH_SIZE) {
     const loaded = await Promise.all(

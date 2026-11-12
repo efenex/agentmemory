@@ -12,6 +12,8 @@ import {
   sessionsTotal,
   lessonsTotal,
   refreshStorageGauges,
+  startStorageGaugeRefresh,
+  requestStorageGaugeRefresh,
   resetStorageGaugeFailureState,
 } from "../src/telemetry/prometheus.js";
 import {
@@ -69,12 +71,39 @@ const okLists: ListImpl = async (scope) => {
   return [];
 };
 
-describe("refreshStorageGauges (full-list path, index not ready)", () => {
+describe("refreshStorageGauges (boot tick)", () => {
   beforeEach(() => {
+    memoriesTotal.reset();
+    resetStorageGaugeFailureState();
+    resetColdScanBackoff();
+    logger.warn.mockClear();
+  });
+
+  it("skips memories (no scan, no series, no warning) on the boot tick before the index is ready", async () => {
+    const kv = kvWith(okLists);
+    await refreshStorageGauges(kv as never, undefined);
+    expect(kv.list.mock.calls.map((c) => c[0])).not.toContain("mem:memories");
+    expect(await memorySamples()).toEqual({});
+    expect(logger.warn).not.toHaveBeenCalled();
+
+    await refreshStorageGauges(kv as never, undefined);
+    expect(await memorySamples()).toEqual({ fact: 2, pattern: 1 });
+  });
+});
+
+describe("refreshStorageGauges (full-list path, index not ready)", () => {
+  beforeEach(async () => {
     memoriesTotal.reset();
     sessionsTotal.reset();
     lessonsTotal.reset();
     resetStorageGaugeFailureState();
+    resetColdScanBackoff();
+    logger.info.mockClear();
+    logger.warn.mockClear();
+    await refreshStorageGauges(kvWith(async () => []) as never, undefined);
+    memoriesTotal.reset();
+    sessionsTotal.reset();
+    lessonsTotal.reset();
     resetColdScanBackoff();
     logger.info.mockClear();
     logger.warn.mockClear();
@@ -195,5 +224,21 @@ describe("refreshStorageGauges (index path)", () => {
     await refreshStorageGauges(kv as never, undefined);
     expect(await memorySamples()).toEqual({ fact: 7 });
     idx.clear();
+  });
+});
+
+describe("requestStorageGaugeRefresh", () => {
+  it("re-runs the refresh immediately once the index becomes ready", async () => {
+    process.env["AGENTMEMORY_METRICS_ENABLED"] = "true";
+    resetStorageGaugeFailureState();
+    const kv = kvWith(async () => []);
+    startStorageGaugeRefresh(kv as never, undefined, 3_600_000);
+    await vi.waitFor(() => expect(kv.list).toHaveBeenCalledWith("mem:sessions"));
+    const before = kv.list.mock.calls.filter((c) => c[0] === "mem:sessions").length;
+    requestStorageGaugeRefresh();
+    await vi.waitFor(() =>
+      expect(kv.list.mock.calls.filter((c) => c[0] === "mem:sessions").length).toBe(before + 1),
+    );
+    delete process.env["AGENTMEMORY_METRICS_ENABLED"];
   });
 });

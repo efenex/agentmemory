@@ -68,6 +68,28 @@ describe("listMemoriesViaIndex", () => {
     expect(await listMemoriesViaIndex(kv)).toBeNull();
   });
 
+  it("returns null when ready but the index holds no mem_ ids", async () => {
+    markMemoryIndexReady();
+    const idx = getSearchIndex();
+    idx.clear();
+    idx.add({
+      id: "obs_only",
+      sessionId: "ses_1",
+      timestamp: "2026-01-01T00:00:00Z",
+      type: "other",
+      title: "an observation",
+      facts: [],
+      narrative: "n",
+      concepts: [],
+      files: [],
+      importance: 5,
+    } as never);
+    const { kv, get } = fakeKv({});
+    expect(await listMemoriesViaIndex(kv)).toBeNull();
+    expect(get).not.toHaveBeenCalled();
+    idx.clear();
+  });
+
   it("loads mem_ ids via bounded kv.get batches, skipping stale and non-memory ids, never kv.list", async () => {
     markMemoryIndexReady();
     const idx = getSearchIndex();

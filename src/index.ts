@@ -103,6 +103,7 @@ import { registerMcpEndpoints } from "./mcp/server.js";
 import {
   metricsEnabled,
   startStorageGaugeRefresh,
+  requestStorageGaugeRefresh,
 } from "./telemetry/prometheus.js";
 import { initTracer, tracingEnabled } from "./telemetry/tracer.js";
 import { getAllTools } from "./mcp/tools-registry.js";
@@ -534,6 +535,7 @@ async function main() {
           bootLog(`Search index rebuilt: ${indexCount} entries`);
           indexPersistence.scheduleSave();
         }
+        requestStorageGaugeRefresh();
       })
       .catch((err) => {
         console.warn(`[agentmemory] Failed to rebuild search index:`, err);
@@ -545,6 +547,7 @@ async function main() {
     // flag and it never runs on this path, so without this every
     // mem::remember falls back to a full memories-scope scan.
     markMemoryIndexReady();
+    requestStorageGaugeRefresh();
     // Backfill memories into BM25 for users upgrading from <0.9.5: prior
     // versions of mem::remember never indexed memories, so the persisted
     // BM25 covers observations only and `memory_smart_search` returns
