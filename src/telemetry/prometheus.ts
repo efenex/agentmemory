@@ -16,6 +16,11 @@ import * as prom from "prom-client";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
+import {
+  coldScanBackedOff,
+  listMemoriesViaIndex,
+  noteColdScanFailure,
+} from "../state/memory-scan.js";
 import type {
   Memory,
   Session,
@@ -300,6 +305,121 @@ export async function renderMetrics(): Promise<{
 
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 
+const failingScopes = new Set<string>();
+
+export function resetStorageGaugeFailureState(): void {
+  failingScopes.clear();
+}
+
+function noteScopeResult(scope: string, err?: unknown): void {
+  if (err === undefined) {
+    if (failingScopes.delete(scope)) {
+      logger.info("storage gauge: list recovered", { scope });
+    }
+    return;
+  }
+  if (failingScopes.has(scope)) return;
+  failingScopes.add(scope);
+  logger.warn("storage gauge: list failed, keeping last value", {
+    scope,
+    error: err instanceof Error ? err.message : String(err),
+  });
+}
+
+async function listForGauge<T>(
+  scope: string,
+  load: () => Promise<T[] | null>,
+): Promise<T[] | null> {
+  try {
+    const rows = await load();
+    if (rows) noteScopeResult(scope);
+    return rows;
+  } catch (err) {
+    noteScopeResult(scope, err);
+    return null;
+  }
+}
+
+async function loadMemoriesForGauge(kv: StateKV): Promise<Memory[] | null> {
+  const viaIndex = await listMemoriesViaIndex(kv);
+  if (viaIndex) return viaIndex;
+  if (coldScanBackedOff()) return null;
+  try {
+    return await kv.list<Memory>(KV.memories);
+  } catch (err) {
+    noteColdScanFailure();
+    throw err;
+  }
+}
+
+/**
+ * One storage-gauge tick. A failed list leaves the previous series in
+ * place (logged once per outage) instead of resetting to an empty gauge.
+ * Memories are counted from the BM25 index ids (bounded kv.get batches)
+ * when the index is ready, falling back to one full-scope list otherwise.
+ */
+export async function refreshStorageGauges(
+  kv: StateKV,
+  metricsStore: MetricsStore | undefined,
+): Promise<void> {
+  try {
+    const sessions = await listForGauge("sessions", () =>
+      kv.list<Session>(KV.sessions),
+    );
+    if (sessions) {
+      const sessionsByStatus: Record<string, number> = {};
+      for (const s of sessions) {
+        const status =
+          (s as Session & { status?: string }).status || "unknown";
+        sessionsByStatus[status] = (sessionsByStatus[status] || 0) + 1;
+      }
+      sessionsTotal.reset();
+      for (const [status, n] of Object.entries(sessionsByStatus)) {
+        sessionsTotal.set({ status }, n);
+      }
+    }
+
+    const memories = await listForGauge("memories", () =>
+      loadMemoriesForGauge(kv),
+    );
+    if (memories) {
+      const memByType: Record<string, number> = {};
+      for (const m of memories) {
+        if (m.isLatest === false) continue;
+        const t = m.type || "fact";
+        memByType[t] = (memByType[t] || 0) + 1;
+      }
+      memoriesTotal.reset();
+      for (const [type, n] of Object.entries(memByType)) {
+        memoriesTotal.set({ type }, n);
+      }
+    }
+
+    const lessons = await listForGauge("lessons", () =>
+      kv.list<Lesson>(KV.lessons),
+    );
+    if (lessons) lessonsTotal.set(lessons.filter((l) => !l.deleted).length);
+
+    const nodes = await listForGauge("graph_nodes", () =>
+      kv.list<GraphNode>(KV.graphNodes),
+    );
+    if (nodes) graphNodesTotal.set(nodes.length);
+    const edges = await listForGauge("graph_edges", () =>
+      kv.list<GraphEdge>(KV.graphEdges),
+    );
+    if (edges) graphEdgesTotal.set(edges.length);
+
+    if (metricsStore) {
+      await syncMetricsStore(metricsStore);
+    }
+  } catch (err) {
+    logger.warn("storage gauge refresh failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+
 /**
  * Start a 30s refresh loop that walks KV to populate the storage gauges
  * (observations/memories/lessons/sessions/graph) and syncs the
@@ -328,56 +448,7 @@ export function startStorageGaugeRefresh(
     intervalMs ??
     Number(process.env["AGENTMEMORY_METRICS_REFRESH_MS"] || "300000");
 
-  const refresh = async (): Promise<void> => {
-    try {
-      // Sessions: count by status. One KV.list — cheap.
-      const sessions = await kv.list<Session>(KV.sessions).catch(() => []);
-      const sessionsByStatus: Record<string, number> = {};
-      for (const s of sessions) {
-        const status =
-          (s as Session & { status?: string }).status || "unknown";
-        sessionsByStatus[status] = (sessionsByStatus[status] || 0) + 1;
-      }
-      sessionsTotal.reset();
-      for (const [status, n] of Object.entries(sessionsByStatus)) {
-        sessionsTotal.set({ status }, n);
-      }
-
-      // Memories by type (only isLatest === true entries). One KV.list.
-      const memories = await kv.list<Memory>(KV.memories).catch(() => []);
-      const memByType: Record<string, number> = {};
-      for (const m of memories) {
-        if (m.isLatest === false) continue;
-        const t = m.type || "fact";
-        memByType[t] = (memByType[t] || 0) + 1;
-      }
-      memoriesTotal.reset();
-      for (const [type, n] of Object.entries(memByType)) {
-        memoriesTotal.set({ type }, n);
-      }
-
-      // Lessons (active, not deleted). One KV.list.
-      const lessons = await kv.list<Lesson>(KV.lessons).catch(() => []);
-      lessonsTotal.set(lessons.filter((l) => !l.deleted).length);
-
-      // Graph nodes/edges (single KV.list each).
-      const nodes = await kv.list<GraphNode>(KV.graphNodes).catch(() => []);
-      const edges = await kv.list<GraphEdge>(KV.graphEdges).catch(() => []);
-      graphNodesTotal.set(nodes.length);
-      graphEdgesTotal.set(edges.length);
-
-      // MetricsStore sync: add the delta of cached per-function totals
-      // into the Counter. We track which functions we've already mirrored
-      // and only add the delta to avoid double-counting on every refresh.
-      if (metricsStore) {
-        await syncMetricsStore(metricsStore);
-      }
-    } catch (err) {
-      logger.warn("storage gauge refresh failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  };
+  const refresh = () => refreshStorageGauges(kv, metricsStore);
 
   void refresh();
   refreshTimer = setInterval(() => void refresh(), ms);

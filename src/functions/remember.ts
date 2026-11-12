@@ -4,6 +4,7 @@ import { KV, generateId, jaccardSimilarity } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { memoryToObservation } from "../state/memory-utils.js";
+import { coldScanBackedOff, noteColdScanFailure } from "../state/memory-scan.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
 import { getSearchIndex, isMemoryIndexReady, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
@@ -18,9 +19,6 @@ function safeSlice(text: string, length: number): string {
   const sliced = text.slice(0, length);
   return /[\uD800-\uDBFF]$/.test(sliced) ? sliced.slice(0, -1) : sliced;
 }
-
-const COLD_SCAN_BACKOFF_MS = 10 * 60 * 1000;
-let coldScanBackoffUntil = 0;
 
 export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::remember", 
@@ -98,7 +96,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
               ),
             );
             candidateMemories = loaded.filter((m): m is Memory => m !== null);
-          } else if (Date.now() >= coldScanBackoffUntil) {
+          } else if (!coldScanBackedOff()) {
             scanned = true;
             candidateMemories = await kv.list<Memory>(KV.memories);
           }
@@ -109,7 +107,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           // engine invocation timeout, and a second scan (or a scan per
           // queued save) keeps the engine thread pinned. Save without
           // supersession and stop cold scans for a while.
-          if (scanned) coldScanBackoffUntil = Date.now() + COLD_SCAN_BACKOFF_MS;
+          if (scanned) noteColdScanFailure();
           logger.warn("supersession candidate lookup failed, saving without supersession", {
             error: err instanceof Error ? err.message : JSON.stringify(err),
           });

@@ -6,6 +6,11 @@ import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
+import {
+  coldScanBackedOff,
+  listMemoriesViaIndex,
+  noteColdScanFailure,
+} from "../state/memory-scan.js";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const CONTRADICTION_THRESHOLD = 0.9;
@@ -21,9 +26,30 @@ interface AutoForgetResult {
   dryRun: boolean;
 }
 
+async function loadMemoriesForForget(
+  kv: StateKV,
+  scheduled: boolean,
+): Promise<Memory[] | null> {
+  const viaIndex = await listMemoriesViaIndex(kv);
+  if (viaIndex) return viaIndex;
+  if (scheduled && coldScanBackedOff()) {
+    logger.warn("auto-forget skipped: memories scan backing off after a failed scan");
+    return null;
+  }
+  try {
+    return await kv.list<Memory>(KV.memories);
+  } catch (err) {
+    noteColdScanFailure();
+    logger.warn("auto-forget memories scan failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
+}
+
 export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::auto-forget", 
-    async (data: { dryRun?: boolean }): Promise<AutoForgetResult> => {
+    async (data: { dryRun?: boolean; scheduled?: boolean }): Promise<AutoForgetResult> => {
       const dryRun = data?.dryRun ?? false;
       const now = Date.now();
       const { decrementImageRef } = await import("./image-refs.js");
@@ -35,7 +61,8 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
         dryRun,
       };
 
-      const memories = await kv.list<Memory>(KV.memories);
+      const memories = await loadMemoriesForForget(kv, data?.scheduled === true);
+      if (!memories) return result;
       const deletedIds = new Set<string>();
       for (const mem of memories) {
         if (mem.forgetAfter) {

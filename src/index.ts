@@ -615,8 +615,12 @@ async function main() {
   if (process.env.AUTO_FORGET_ENABLED !== "false") {
     const autoForgetTimer = setInterval(async () => {
       try {
-        await sdk.trigger({ function_id: "mem::auto-forget", payload: { dryRun: false } });
-      } catch {}
+        await sdk.trigger({ function_id: "mem::auto-forget", payload: { dryRun: false, scheduled: true } });
+      } catch (err) {
+        logger.warn("scheduled auto-forget failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }, autoForgetIntervalMs);
     autoForgetTimer.unref();
     bootLog(`Auto-forget: enabled (every ${autoForgetIntervalMs / 60000}m)`);

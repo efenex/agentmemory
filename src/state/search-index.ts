@@ -163,6 +163,10 @@ export class SearchIndex {
     return this.entries.size;
   }
 
+  ids(): string[] {
+    return Array.from(this.entries.keys());
+  }
+
   clear(): void {
     this.entries.clear();
     this.invertedIndex.clear();
