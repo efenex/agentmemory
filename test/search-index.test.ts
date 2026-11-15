@@ -291,3 +291,50 @@ describe("SearchIndex", () => {
     expect(segmentCjk("项目 trailing")).toEqual(["项目", "trailing"]);
   });
 });
+
+describe("SearchIndex orphan postings (chunked-load inconsistency)", () => {
+  // Reproduces the 2026-11-15 smart-search 500: the inverted-index chunk was
+  // persisted later than the entries chunk, so on load some posting lists
+  // referenced ids with no entry -> "Cannot read properties of undefined
+  // (reading 'termCount')" for every query hitting such a term.
+  function orphanedIndex(): SearchIndex {
+    const live = new SearchIndex();
+    live.add(makeObs({ id: "obs_ok", title: "gpu clock cap", narrative: "gpu clock" }));
+    live.add(makeObs({ id: "obs_orphan", sessionId: "ses_2", title: "gpu clock", narrative: "gpu" }));
+    const src = live as any;
+    const idx = new SearchIndex();
+    // entries chunk written before obs_orphan was added; inverted/docTerms after.
+    idx.appendEntriesChunkJson(JSON.stringify([["obs_ok", src.entries.get("obs_ok")]]));
+    idx.appendInvertedChunkJson(
+      JSON.stringify(
+        Array.from(src.invertedIndex.entries()).map(([t, ids]: [string, Set<string>]) => [t, [...ids]]),
+      ),
+    );
+    idx.appendDocTermsChunkJson(
+      JSON.stringify(
+        Array.from(src.docTermCounts.entries()).map(([id, m]: [string, Map<string, number>]) => [id, [...m.entries()]]),
+      ),
+    );
+    return idx;
+  }
+
+  it("search() does not throw on orphan postings and returns only real docs", () => {
+    const idx = orphanedIndex();
+    expect(() => idx.search("gpu")).not.toThrow();
+    expect(() => idx.search("gp")).not.toThrow(); // prefix path
+    const ids = idx.search("gpu clock").map((r) => r.obsId);
+    expect(ids).toEqual(["obs_ok"]);
+  });
+
+  it("reconcile() prunes orphans and recomputes totalDocLength", () => {
+    const idx = orphanedIndex();
+    const r = idx.reconcile();
+    expect(r.orphanPostings).toBeGreaterThan(0);
+    expect(r.orphanDocTerms).toBe(1);
+    expect(idx.reconcile()).toEqual({ orphanPostings: 0, orphanDocTerms: 0 });
+    expect(idx.search("gpu").map((x) => x.obsId)).toEqual(["obs_ok"]);
+    const src = idx as any;
+    expect(src.docTermCounts.has("obs_orphan")).toBe(false);
+    expect(src.totalDocLength).toBe(src.entries.get("obs_ok").termCount);
+  });
+});

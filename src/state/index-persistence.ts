@@ -313,6 +313,17 @@ export class IndexPersistence {
       }
     }
 
+    if (bm25) {
+      const { orphanPostings, orphanDocTerms } = bm25.reconcile();
+      if (orphanPostings > 0 || orphanDocTerms > 0) {
+        logger.warn("bm25 index: dropped orphan postings after load", {
+          orphanPostings,
+          orphanDocTerms,
+          entries: bm25.size,
+        });
+      }
+    }
+
     return { bm25, vector };
   }
 

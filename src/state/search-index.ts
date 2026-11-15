@@ -74,6 +74,39 @@ export class SearchIndex {
     this.sortedTerms = null;
   }
 
+  /**
+   * Drop postings and per-doc term counts whose id has no entry, then
+   * recompute totalDocLength from the entries. A chunked persist/load can
+   * leave such orphans (entries/inverted/docTerms are saved as separate
+   * streams while the index keeps mutating, or a chunk read fails and is
+   * skipped); search() used to throw "reading 'termCount'" on them.
+   * Returns how many orphan postings + docTerms rows were removed.
+   */
+  reconcile(): { orphanPostings: number; orphanDocTerms: number } {
+    let orphanPostings = 0;
+    let orphanDocTerms = 0;
+    for (const [term, ids] of this.invertedIndex) {
+      for (const id of ids) {
+        if (!this.entries.has(id)) {
+          ids.delete(id);
+          orphanPostings++;
+        }
+      }
+      if (ids.size === 0) this.invertedIndex.delete(term);
+    }
+    for (const id of this.docTermCounts.keys()) {
+      if (!this.entries.has(id)) {
+        this.docTermCounts.delete(id);
+        orphanDocTerms++;
+      }
+    }
+    let total = 0;
+    for (const e of this.entries.values()) total += e.termCount;
+    this.totalDocLength = total;
+    if (orphanPostings > 0 || orphanDocTerms > 0) this.sortedTerms = null;
+    return { orphanPostings, orphanDocTerms };
+  }
+
   search(
     query: string,
     limit = 20,
@@ -110,7 +143,9 @@ export class SearchIndex {
         const idf = Math.log((N - df + 0.5) / (df + 0.5) + 1);
 
         for (const obsId of matchingDocs) {
-          const entry = this.entries.get(obsId)!;
+          const entry = this.entries.get(obsId);
+          // Orphan posting (id indexed but no entry): skip, never throw.
+          if (!entry) continue;
           const docTerms = this.docTermCounts.get(obsId);
           const tf = docTerms?.get(term) || 0;
           const docLen = entry.termCount;
@@ -130,12 +165,14 @@ export class SearchIndex {
         if (!indexTerm.startsWith(term)) break;
         if (indexTerm === term) continue;
 
-        const obsIds = this.invertedIndex.get(indexTerm)!;
+        const obsIds = this.invertedIndex.get(indexTerm);
+        if (!obsIds) continue;
         const prefixDf = obsIds.size;
         const prefixIdf =
           Math.log((N - prefixDf + 0.5) / (prefixDf + 0.5) + 1) * 0.5;
         for (const obsId of obsIds) {
-          const entry = this.entries.get(obsId)!;
+          const entry = this.entries.get(obsId);
+          if (!entry) continue;
           const docTerms = this.docTermCounts.get(obsId);
           const tf = docTerms?.get(indexTerm) || 0;
           const docLen = entry.termCount;
@@ -151,10 +188,11 @@ export class SearchIndex {
     }
 
     return Array.from(scores.entries())
-      .map(([obsId, score]) => {
-        const entry = this.entries.get(obsId)!;
-        return { obsId, sessionId: entry.sessionId, score };
-      })
+      .map(([obsId, score]) => ({
+        obsId,
+        sessionId: this.entries.get(obsId)!.sessionId,
+        score,
+      }))
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
   }
