@@ -889,25 +889,61 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
-      // Bounded fan-out: each kv.get is a full engine invocation, so
-      // Promise.all over hundreds of sessions saturates the invocation
-      // pool. Batch in chunks of 10 (parallel within a chunk, sequential
-      // across chunks); the summaries array stays index-aligned with
-      // `filtered`.
-      const summaries: Array<SessionSummary | null> = [];
-      for (let batch = 0; batch < filtered.length; batch += 10) {
-        const chunk = filtered.slice(batch, batch + 10);
-        const results = await Promise.all(
-          chunk.map((s) =>
-            kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
-          ),
-        );
-        summaries.push(...results);
+      const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
+      const rawOffset = parseOptionalInt(req.query_params?.["offset"]);
+      const paginated = rawLimit !== undefined || rawOffset !== undefined;
+
+      if (!paginated) {
+        // One scope list instead of one kv.get per session: each get is a
+        // full engine invocation (~40 ms per batch of 10 on a 3k-session store).
+        const summaryById = new Map<string, SessionSummary>();
+        const allSummaries = await kv
+          .list<SessionSummary>(KV.summaries)
+          .catch(() => [] as SessionSummary[]);
+        for (const summary of allSummaries) {
+          if (summary?.sessionId) summaryById.set(summary.sessionId, summary);
+        }
+        const withSummary = filtered.map((s) => {
+          const summary = s.id ? summaryById.get(s.id) : undefined;
+          return summary ? { ...s, summary } : s;
+        });
+        return { status_code: 200, body: { sessions: withSummary } };
       }
-      const withSummary = filtered.map((s, i) =>
-        summaries[i] ? { ...s, summary: summaries[i] } : s,
+
+      const keyed = filtered.filter((s) => typeof s.id === "string" && s.id);
+      keyed.sort((a, b) =>
+        (b.startedAt || "").localeCompare(a.startedAt || ""),
       );
-      return { status_code: 200, body: { sessions: withSummary } };
+      const offset = Math.max(0, rawOffset ?? 0);
+      const limit =
+        rawLimit === undefined
+          ? undefined
+          : Math.max(1, Math.min(5000, rawLimit));
+      const page = keyed.slice(
+        offset,
+        limit === undefined ? undefined : offset + limit,
+      );
+      // Summaries are fetched for the page only, in chunks of 10 (parallel
+      // within a chunk, sequential across chunks) to keep the engine's
+      // invocation pool bounded.
+      const pageSummaries: Array<SessionSummary | null> = [];
+      for (let batch = 0; batch < page.length; batch += 10) {
+        const results = await Promise.all(
+          page
+            .slice(batch, batch + 10)
+            .map((s) =>
+              kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
+            ),
+        );
+        pageSummaries.push(...results);
+      }
+      const withSummary = page.map((s, i) =>
+        pageSummaries[i] ? { ...s, summary: pageSummaries[i] } : s,
+      );
+      return {
+        status_code: 200,
+        body: { sessions: withSummary, total: keyed.length, offset },
+      };
     },
   );
   sdk.registerTrigger({
